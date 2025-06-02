@@ -1,0 +1,22 @@
+# @package data
+
+# Latent data configuration for Aria (using KITTI latent approach)
+_target_: src.data.vio_datamodule.VIODataModule
+
+# Data loading parameters
+batch_size: 32
+num_workers: 4
+pin_memory: True
+
+# Data loaders - using same structure as KITTI latent
+train_loader:
+  _target_: src.data.components.latent_kitti_dataset.LatentVectorDataset
+  root_dir: aria_latent_data/train
+
+val_loader:
+  _target_: src.data.components.latent_kitti_dataset.LatentVectorDataset
+  root_dir: aria_latent_data/val
+
+test_loader:
+  _target_: src.data.components.latent_kitti_dataset.LatentVectorDataset
+  root_dir: aria_latent_data/test

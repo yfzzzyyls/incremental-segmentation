@@ -1,0 +1,30 @@
+# @package data
+
+_target_: src.data.aria_datamodule.AriaDataModule
+
+# Data paths
+train_data_dir: ${paths.data_dir}/aria_real_train  # Path to processed training data
+test_data_dir: ${paths.data_dir}/aria_real_test     # Path to processed test data
+train_sequences: [0, 1, 2, 3, 4, 5, 6, 7, 8]       # Training sequence IDs (use most sequences for training)
+val_sequences: [9]                                  # Validation sequence IDs (last sequence from training)
+test_sequences: [0, 1, 2, 3, 4]                    # Test sequence IDs (from test folder)
+
+# Data loading parameters
+batch_size: 4
+num_workers: 4
+pin_memory: True
+
+# Sequence parameters
+seq_len: 11        # Number of frames per sequence
+overlap: 5         # Overlap between consecutive sequences
+max_frames: 500    # Maximum frames per original sequence
+
+# Data augmentation
+augment: True
+rotation_std: 0.1
+translation_std: 0.01
+
+# Normalization parameters
+normalize_poses: True
+pose_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]  # [tx, ty, tz, qx, qy, qz, qw]
+pose_std: [1.0, 1.0, 1.0, 0.1, 0.1, 0.1, 0.1]

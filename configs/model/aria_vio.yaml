@@ -1,0 +1,49 @@
+# @package model
+
+# Model configuration for Aria VIO training
+_target_: src.models.vio_module.VIOLitModule
+
+# Optimizer configuration - will be instantiated by Lightning with model parameters
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.0001
+  weight_decay: 1e-4
+
+# Scheduler configuration  
+scheduler: null
+
+# Loss function - Use WeightedMSEPoseLoss for better pose training
+criterion:
+  _target_: src.metrics.weighted_loss.WeightedMSEPoseLoss
+  angle_weight: 100
+
+# Network architecture - Use PoseTransformer
+net:
+  _target_: src.models.components.pose_transformer.PoseTransformer
+  input_dim: 768
+  embedding_dim: 128
+  num_layers: 2
+  nhead: 8
+  dim_feedforward: 512
+  dropout: 0.1
+
+# Metrics calculator for evaluation
+metrics_calculator:
+  _target_: src.metrics.kitti_metrics_calculator.KITTIMetricsCalculator
+
+# Tester for evaluation - adapted for Aria data
+tester:
+  _target_: src.testers.kitti_latent_tester.KITTILatentTester
+  val_seqs: ['00', '01', '02']  # Placeholder - will use Aria test sequences
+  data_dir: aria_latent_data/test_5
+  seq_len: 11
+  folder: sequences
+  img_w: 512
+  img_h: 256
+  wrapper_weights_path: ${paths.root_dir}/pretrained_models/vf_512_if_256_3e-05.model
+  device: 'mps'  # Change to 'cuda' if using GPU
+  v_f_len: 512
+  i_f_len: 256
+
+compile: false

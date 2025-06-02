@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Training outputs
+logs/
+outputs/
+wandb/
+*.log
+
+# Model checkpoints
+checkpoints/
+*.pth
+*.ckpt
+
+# Data directories (too large for git)
+data/aria_everyday/
+data/aria_processed/
+data/aria_latent_data*/
+aria_latent_data*/
+Visual-Selective-VIO-Pretrained/
+pretrained_models/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Documentation builds
+docs/_build/
+site/
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
