@@ -55,9 +55,10 @@ class ARVRLossWrapper(nn.Module):
     rotation (quaternion) and translation predictions.
     """
     
-    def __init__(self):
+    def __init__(self, use_log_scale=True, use_weighted_loss=False):
         super().__init__()
-        self.translation_loss = nn.MSELoss()
+        self.use_log_scale = use_log_scale
+        self.use_weighted_loss = use_weighted_loss
         self.rotation_loss = ProperQuaternionLoss()
         
     def forward(self, pred_rotation, target_rotation, pred_translation, target_translation):
@@ -71,36 +72,54 @@ class ARVRLossWrapper(nn.Module):
         Returns:
             Dictionary with loss components
         """
-        # Compute basic losses
+        # Compute rotation loss (geodesic distance)
         rot_loss = self.rotation_loss(pred_rotation, target_rotation)
-        trans_loss = self.translation_loss(pred_translation, target_translation)
         
-        # Scale rotation loss to be in similar range as translation
-        # Rotation loss is in [0, 1], scale it up
-        rot_loss = rot_loss * 10.0  # Adjust this scaling factor as needed
+        # Compute translation loss using Huber/SmoothL1 loss for robustness
+        # This is less sensitive to outliers than MSE and works better for small values
+        trans_loss = torch.nn.functional.smooth_l1_loss(pred_translation, target_translation)
         
-        # Compute scale-aware weights based on motion magnitude
-        with torch.no_grad():
-            # Translation magnitude
-            trans_magnitude = torch.norm(target_translation, dim=-1)
-            trans_weight = torch.ones_like(trans_magnitude)
-            trans_weight[trans_magnitude < 0.01] = 3.0  # Small motions < 1cm
-            trans_weight[trans_magnitude > 0.05] = 0.5  # Large motions > 5cm
+        # Optional: use log-scale to prevent underflow with very small values
+        if self.use_log_scale:
+            # Add 1 to prevent log(0), multiply by 100 to scale up small cm values
+            trans_loss = torch.log1p(trans_loss * 100.0)
+            rot_loss = torch.log1p(rot_loss * 100.0)
+        
+        # Scale losses to similar magnitudes
+        # Translation is in cm, rotation is unitless [0,1]
+        rot_loss = rot_loss * 10.0
+        
+        if self.use_weighted_loss:
+            # Compute scale-aware weights based on motion magnitude
+            with torch.no_grad():
+                # Translation magnitude
+                trans_magnitude = torch.norm(target_translation, dim=-1)
+                trans_weight = torch.ones_like(trans_magnitude)
+                # Reduced weighting to avoid bias toward zero motion
+                trans_weight[trans_magnitude < 0.01] = 1.5  # Was 3.0
+                trans_weight[trans_magnitude > 0.05] = 0.8  # Was 0.5
+                
+                # Rotation magnitude (quaternion angle)
+                quat_dot = target_rotation[:, 3]  # w component
+                quat_angle = 2 * torch.acos(torch.clamp(quat_dot.abs(), -1, 1))
+                rot_weight = torch.ones_like(quat_angle)
+                rot_weight[quat_angle < 0.035] = 1.5  # Was 3.0
+                rot_weight[quat_angle > 0.175] = 0.8  # Was 0.5
             
-            # Rotation magnitude (quaternion angle)
-            # Angle between identity and target quaternion
-            quat_dot = target_rotation[:, 3]  # w component
-            quat_angle = 2 * torch.acos(torch.clamp(quat_dot.abs(), -1, 1))
-            rot_weight = torch.ones_like(quat_angle)
-            rot_weight[quat_angle < 0.035] = 3.0  # Small rotations < 2°
-            rot_weight[quat_angle > 0.175] = 0.5  # Large rotations > 10°
+            # Apply weights
+            weighted_trans_loss = trans_loss * trans_weight.mean()
+            weighted_rot_loss = rot_loss * rot_weight.mean()
+        else:
+            # No weighting - treat all motions equally
+            weighted_trans_loss = trans_loss
+            weighted_rot_loss = rot_loss
         
-        # Apply weights
-        weighted_trans_loss = (trans_loss * trans_weight.mean())
-        weighted_rot_loss = (rot_loss * rot_weight.mean())
+        # Add a small regularization term to prevent trivial solutions
+        reg_loss = 0.001 * (pred_rotation.norm(dim=-1).mean() + pred_translation.norm(dim=-1).mean())
         
         return {
             'translation_loss': weighted_trans_loss,
             'rotation_loss': weighted_rot_loss,
-            'total_loss': weighted_trans_loss + weighted_rot_loss
+            'regularization_loss': reg_loss,
+            'total_loss': weighted_trans_loss + weighted_rot_loss + reg_loss
         }

@@ -2,6 +2,7 @@
 """
 Complete pipeline to generate latent features using Visual-Selective-VIO pretrained model
 from processed Aria data with FIXED relative pose conversion in local coordinates.
+Updated to work with quaternion data directly without Euler conversion.
 """
 
 import os
@@ -13,7 +14,6 @@ import json
 from tqdm import tqdm
 from pathlib import Path
 import torch.nn.functional as F
-from scipy.spatial.transform import Rotation
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.models.components.vsvio import Encoder
@@ -33,12 +33,10 @@ class WrapperModel(nn.Module):
         self.Feature_net = Encoder(Params())
         
     def forward(self, imgs, imus):
-        # The model outputs 10 frames for 11 input frames
+        # The model outputs 10 transition features for 11 input frames
         v_feat, i_feat = self.Feature_net(imgs, imus)
-        # Pad to 11 frames by repeating the last frame
-        v_feat_padded = torch.cat([v_feat, v_feat[:, -1:, :]], dim=1)
-        i_feat_padded = torch.cat([i_feat, i_feat[:, -1:, :]], dim=1)
-        return torch.cat([v_feat_padded, i_feat_padded], dim=-1)
+        # Return visual and IMU features separately (10 features each)
+        return v_feat, i_feat  # Both are [B, 10, feature_dim]
 
 
 def quaternion_to_rotation_matrix(q):
@@ -157,23 +155,41 @@ def process_sequence(seq_dir, model, device, window_size=11, stride=1, pose_scal
     visual_data = torch.load(os.path.join(seq_dir, 'visual_data.pt'))  # [N, 3, H, W]
     imu_data = torch.load(os.path.join(seq_dir, 'imu_data.pt'))        # [N, 33, 6]
     
-    # Load poses
-    with open(os.path.join(seq_dir, 'poses.json'), 'r') as f:
+    # Ensure float32 data type for compatibility with the model
+    visual_data = visual_data.float()  # Convert to float32 if it's float64
+    imu_data = imu_data.float()  # Convert to float32 if it's float64
+    
+    # Load poses - check for quaternion version first
+    poses_file = os.path.join(seq_dir, 'poses_quaternion.json')
+    if not os.path.exists(poses_file):
+        # Fallback to regular poses.json
+        poses_file = os.path.join(seq_dir, 'poses.json')
+    
+    with open(poses_file, 'r') as f:
         poses_data = json.load(f)
     
     # Convert poses to tensor with XYZW quaternion format
     absolute_poses = []
     for pose in poses_data:
-        # Get translation and rotation
+        # Get translation
         t = pose['translation']
-        euler = pose['rotation_euler']  # [roll, pitch, yaw]
         
-        # Convert Euler angles to quaternion
-        r = Rotation.from_euler('xyz', euler)
-        q = r.as_quat()  # [x, y, z, w] - already in XYZW format
+        # Check if we have quaternion data directly
+        if 'quaternion' in pose:
+            # Already have quaternion in XYZW format
+            q = pose['quaternion']
+            pose_vec = [t[0], t[1], t[2], q[0], q[1], q[2], q[3]]
+        elif 'rotation_euler' in pose:
+            # Convert Euler to quaternion (backward compatibility)
+            from scipy.spatial.transform import Rotation
+            euler = pose['rotation_euler']  # [roll, pitch, yaw]
+            r = Rotation.from_euler('xyz', euler)
+            q = r.as_quat()  # [x, y, z, w] - already in XYZW format
+            pose_vec = [t[0], t[1], t[2], q[0], q[1], q[2], q[3]]
+        else:
+            # No rotation data - use identity
+            pose_vec = [t[0], t[1], t[2], 0, 0, 0, 1]
         
-        # Combine translation and quaternion
-        pose_vec = [t[0], t[1], t[2], q[0], q[1], q[2], q[3]]
         absolute_poses.append(pose_vec)
     absolute_poses = np.array(absolute_poses, dtype=np.float32)
     
@@ -221,20 +237,19 @@ def process_sequence(seq_dir, model, device, window_size=11, stride=1, pose_scal
         
         # Generate features
         with torch.no_grad():
-            features = model(batch_visual, batch_imu)  # [1, 11, 768]
-            features = features.squeeze(0).cpu()        # [11, 768]
+            v_feat, i_feat = model(batch_visual, batch_imu)  # Both are [1, 10, feature_dim]
+            v_feat = v_feat.squeeze(0).cpu()  # [10, 512]
+            i_feat = i_feat.squeeze(0).cpu()  # [10, 256]
         
-        # Average IMU samples for each frame (33 -> 1)
-        window_imu_avg = window_imu.mean(dim=1)  # [11, 6]
-        
-        features_list.append(features)
-        poses_list.append(torch.from_numpy(window_relative_poses))
-        imus_list.append(window_imu_avg)
+        # Store visual and IMU features separately
+        features_list.append((v_feat, i_feat))
+        # Store poses for transitions (skip first pose as it's always origin)
+        poses_list.append(torch.from_numpy(window_relative_poses[1:]))  # [10, 7]
     
-    return features_list, poses_list, imus_list
+    return features_list, poses_list
 
 
-def generate_split_data(processed_dir, output_dir, model, device, pose_scale=100.0, stride=1, split_ratios=(0.7, 0.1, 0.2)):
+def generate_split_data(processed_dir, output_dir, model, device, pose_scale=100.0, stride=1, split_ratios=(0.7, 0.1, 0.2), skip_test=True):
     """Generate train/val/test splits from processed sequences with relative poses."""
     
     # Get all sequence directories (filter out non-numeric directories)
@@ -258,17 +273,58 @@ def generate_split_data(processed_dir, output_dir, model, device, pose_scale=100
     
     print(f"Split: {len(train_seqs)} train, {len(val_seqs)} val, {len(test_seqs)} test sequences")
     
+    # Save split information for consistent evaluation
+    split_info = {
+        'total_sequences': num_sequences,
+        'split_ratios': split_ratios,
+        'splits': {
+            'train': {
+                'indices': list(range(0, train_size)),
+                'sequences': [s.name for s in train_seqs],
+                'count': len(train_seqs)
+            },
+            'val': {
+                'indices': list(range(train_size, train_size + val_size)),
+                'sequences': [s.name for s in val_seqs],
+                'count': len(val_seqs)
+            },
+            'test': {
+                'indices': list(range(train_size + val_size, num_sequences)),
+                'sequences': [s.name for s in test_seqs],
+                'count': len(test_seqs)
+            }
+        }
+    }
+    
+    # Save split information
+    import json
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, 'dataset_splits.json'), 'w') as f:
+        json.dump(split_info, f, indent=2)
+    
+    # Save test sequences list
+    with open(os.path.join(output_dir, 'test_sequences.txt'), 'w') as f:
+        f.write('\n'.join([s.name for s in test_seqs]))
+    
+    print(f"💾 Saved dataset split information to {output_dir}/dataset_splits.json")
+    print(f"📝 Test sequences saved to {output_dir}/test_sequences.txt")
+    
     # Process each split
     splits = {
         'train': train_seqs,
-        'val': val_seqs,
-        'test': test_seqs
+        'val': val_seqs
     }
+    
+    # Only process test if not skipping
+    if not skip_test:
+        splits['test'] = test_seqs
+    else:
+        print("⏭️  Skipping test set processing (will use real-time encoding during inference)")
     
     sample_counter = {
         'train': 0,
         'val': 0,
-        'test': 0
+        'test': 0  # Initialize even if skipping test
     }
     
     # Track statistics across all samples
@@ -283,30 +339,24 @@ def generate_split_data(processed_dir, output_dir, model, device, pose_scale=100
         for seq_dir in tqdm(sequences, desc=f"{split_name} sequences"):
             try:
                 # Process sequence with relative poses
-                features_list, poses_list, imus_list = process_sequence(
+                features_list, poses_list = process_sequence(
                     seq_dir, model, device, 
                     window_size=11, stride=stride, pose_scale=pose_scale
                 )
                 
                 # Save each window as a sample
-                for features, poses, imus in zip(features_list, poses_list, imus_list):
+                for (v_feat, i_feat), poses in zip(features_list, poses_list):
                     sample_id = sample_counter[split_name]
                     
-                    # Save features (768-dim latent features)
-                    np.save(os.path.join(split_dir, f"{sample_id}.npy"), features.numpy())
+                    # Save visual and IMU features separately
+                    np.save(os.path.join(split_dir, f"{sample_id}_visual.npy"), v_feat.numpy())  # [10, 512]
+                    np.save(os.path.join(split_dir, f"{sample_id}_imu.npy"), i_feat.numpy())     # [10, 256]
                     
-                    # Save ground truth poses (now relative poses in local coordinates)
+                    # Save ground truth poses (now relative poses for transitions)
                     np.save(os.path.join(split_dir, f"{sample_id}_gt.npy"), poses.numpy())
                     
-                    # Save IMU data
-                    np.save(os.path.join(split_dir, f"{sample_id}_w.npy"), imus.numpy())
-                    
-                    # Save rotation component separately (for compatibility)
-                    rotations = poses[:, 3:7].numpy()  # quaternions
-                    np.save(os.path.join(split_dir, f"{sample_id}_rot.npy"), rotations)
-                    
-                    # Collect statistics (skip first frame which is always identity)
-                    for i in range(1, len(poses)):
+                    # Collect statistics (all poses are now transitions, no identity)
+                    for i in range(len(poses)):
                         # Translation norm
                         trans_norm = np.linalg.norm(poses[i, :3].numpy())
                         all_translation_norms.append(trans_norm)
@@ -363,6 +413,10 @@ def main():
                         help='Stride for sliding window (default: 1)')
     parser.add_argument('--pose-scale', type=float, default=100.0,
                         help='Scale factor for poses (default: 100.0 for meter to cm conversion)')
+    parser.add_argument('--skip-test', action='store_true', default=True,
+                        help='Skip test set processing (default: True, use real-time encoding for inference)')
+    parser.add_argument('--process-test', action='store_true',
+                        help='Process test set (overrides --skip-test)')
     
     args = parser.parse_args()
     
@@ -386,7 +440,7 @@ def main():
     print(f"Stride: {args.stride}")
     print(f"Pose scale: {args.pose_scale} (meter → cm)")
     print(f"Output directory: {args.output_dir}")
-    print(f"Pose format: Relative poses in LOCAL COORDINATES (fixed!)")
+    print(f"Pose format: Relative poses in LOCAL COORDINATES with quaternions")
     
     sample_counts = generate_split_data(
         args.processed_dir, 
@@ -394,7 +448,8 @@ def main():
         model, 
         device,
         pose_scale=args.pose_scale,
-        stride=args.stride
+        stride=args.stride,
+        skip_test=not args.process_test  # Skip test unless explicitly requested
     )
     
     # Save metadata
@@ -402,6 +457,7 @@ def main():
         'feature_dim': 768,
         'visual_dim': 512,
         'inertial_dim': 256,
+        'sequence_length': 10,  # 10 transition features from 11 frames
         'window_size': args.window_size,
         'stride': args.stride,
         'pose_scale': args.pose_scale,
@@ -410,20 +466,26 @@ def main():
         'model_path': args.model_path,
         'normalization': '[-0.5, 0.5]',
         'sample_counts': sample_counts,
-        'note': 'Features with FIXED relative poses in local coordinates - proper coordinate transformation applied!'
+        'feature_format': 'separate',  # visual and IMU features saved separately
+        'note': 'Features are transitions between frames (10 features from 11 frames). Visual and IMU features saved separately for proper transformer input.'
     }
     
     import pickle
     with open(os.path.join(args.output_dir, 'metadata.pkl'), 'wb') as f:
         pickle.dump(metadata, f)
     
-    print(f"\n✅ Successfully generated all latent features with FIXED quaternions!")
+    print(f"\n✅ Successfully generated latent features!")
     print(f"Total samples:")
     for split, count in sample_counts.items():
-        print(f"  {split}: {count}")
+        if count > 0:  # Only show splits that were processed
+            print(f"  {split}: {count}")
     print(f"\nFeatures saved to: {args.output_dir}")
+    
+    if not args.process_test:
+        print(f"\n📝 Note: Test set was skipped. During inference, use real-time encoding.")
+    
     print(f"\nYou can now train your model using:")
-    print(f"python train_pretrained_relative.py --data_dir {args.output_dir}")
+    print(f"python train_separate_features.py --data_dir {args.output_dir}")
 
 
 if __name__ == '__main__':

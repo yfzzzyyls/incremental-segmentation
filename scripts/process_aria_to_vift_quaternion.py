@@ -65,110 +65,69 @@ class AriaToVIFTProcessor:
                         # adjust if nested in subfolder
                         summary_file = summary_file if summary_file.exists() else temp_sum / Path(name).name
                     else:
-                        raise FileNotFoundError('summary.json not found in archive')
-
+                        print(f"❌ No summary.json found in archive")
+                        shutil.rmtree(temp_sum, ignore_errors=True)
+                        return None
+                        
                 if summary_file.exists():
-                    print(f"📄 Parsing SLAM summary: {summary_file.relative_to(sequence_path)}")
+                    with open(summary_file, 'r') as f:
+                        summary_data = json.load(f)
+                    
                     poses = []
-                    with open(summary_file, 'r') as sf:
-                        for line in sf:
-                            try:
-                                obj = json.loads(line)
-                                if all(k in obj for k in ['tracking_timestamp_us','tx_world_device','ty_world_device','tz_world_device','qx_world_device','qy_world_device','qz_world_device','qw_world_device']):
-                                    ts = float(obj['tracking_timestamp_us'])/1e6
-                                    tx,ty,tz = obj['tx_world_device'],obj['ty_world_device'],obj['tz_world_device']
-                                    qx,qy,qz,qw = obj['qx_world_device'],obj['qy_world_device'],obj['qz_world_device'],obj['qw_world_device']
-                                    
-                                    # Ensure quaternion is normalized
-                                    q_norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
-                                    if q_norm > 0:
-                                        qx, qy, qz, qw = qx/q_norm, qy/q_norm, qz/q_norm, qw/q_norm
-                                    
-                                    # Store pose with quaternion in XYZW format
-                                    poses.append({
-                                        'timestamp': ts, 
-                                        'translation': [tx, ty, tz],
-                                        'quaternion': [qx, qy, qz, qw]  # XYZW format
-                                    })
-                            except json.JSONDecodeError:
-                                continue
+                    # Extract poses from summary data
+                    if 'trajectory' in summary_data:
+                        for frame in summary_data['trajectory']:
+                            timestamp = frame['timestamp']
+                            pose = frame['pose']
+                            # Expecting [tx, ty, tz, qx, qy, qz, qw]
+                            poses.append({
+                                'timestamp': timestamp,
+                                'translation': pose[:3],
+                                'quaternion': pose[3:]  # Keep as [qx, qy, qz, qw]
+                            })
+                    
                     shutil.rmtree(temp_sum, ignore_errors=True)
                     if poses:
                         print(f"✅ Extracted {len(poses)} poses from summary.json")
                         return poses
+                        
             except Exception as e:
-                print(f"⚠️ Summary parsing failed: {e}")
-            shutil.rmtree(temp_sum, ignore_errors=True)
-
-        # Look for SLAM trajectory archives
-        slam_archives = list(sequence_path.glob("*mps_slam_trajectories*"))
-        if not slam_archives:
-            print(f"⚠️ No SLAM trajectory found in {sequence_path.name}")
+                print(f"❌ Error processing summary zip: {e}")
+                shutil.rmtree(temp_sum, ignore_errors=True)
+        
+        # Find MPS output archives
+        archives = list(sequence_path.glob("*mps_[so]*.zip"))
+        if not archives:
+            print(f"❌ No MPS output found")
             return None
             
-        # Try to extract trajectory CSV using multiple methods
-        for archive in slam_archives:
-            temp_dir = sequence_path / "temp_slam"
+        # Sort by priority (closed_loop better than open_loop)
+        archives.sort(key=lambda x: (0 if 'closed_loop' in x.name else 1))
+        
+        for archive in archives:
+            temp_dir = sequence_path / f"temp_extract_{archive.stem}"
             temp_dir.mkdir(exist_ok=True)
             
-            try:
-                # Method 1: Try shutil.unpack_archive (handles various formats)
-                print(f"🔄 Attempting to unpack {archive.name} using shutil...")
-                shutil.unpack_archive(str(archive), str(temp_dir))
-                print(f"✅ Successfully unpacked {archive.name}")
-                
-            except Exception as e1:
-                print(f"⚠️ shutil.unpack_archive failed: {e1}")
-                
-                try:
-                    # Method 2: Try zipfile module
-                    print(f"🔄 Attempting to unpack {archive.name} using zipfile...")
-                    with zipfile.ZipFile(archive, 'r') as zip_ref:
-                        zip_ref.extractall(temp_dir)
-                    print(f"✅ Successfully unpacked {archive.name} with zipfile")
-                    
-                except Exception as e2:
-                    print(f"⚠️ zipfile extraction failed: {e2}")
-                    
-                    try:
-                        # Method 3: Try subprocess unzip command
-                        print(f"🔄 Attempting to unpack {archive.name} using system unzip...")
-                        import subprocess
-                        result = subprocess.run(['unzip', '-q', str(archive), '-d', str(temp_dir)], 
-                                              capture_output=True, text=True)
-                        if result.returncode == 0:
-                            print(f"✅ Successfully unpacked {archive.name} with system unzip")
-                        else:
-                            raise Exception(f"unzip failed: {result.stderr}")
-                            
-                    except Exception as e3:
-                        print(f"⚠️ All extraction methods failed: {e3}")
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                        continue
+            # Extract archive
+            shutil.unpack_archive(archive, temp_dir)
             
-            # Look for trajectory CSV files in extracted content
-            csv_files = []
-            
-            # Search patterns in order of preference
-            search_patterns = [
-                "*closed_loop*.csv",
-                "*open_loop*.csv", 
-                "*trajectory*.csv",
-                "*.csv"
+            # Look for trajectory CSV files
+            csv_files = list(temp_dir.rglob("*trajectory*.csv"))
+            # Sort by priority
+            priority_order = [
+                'closed_loop_trajectory.csv',
+                'open_loop_trajectory.csv',
+                'slam_trajectory_derivate.csv',
+                'trajectory.csv'
             ]
             
-            for pattern in search_patterns:
-                csv_files = list(temp_dir.rglob(pattern))
-                if csv_files:
-                    # Filter out non-trajectory files
-                    trajectory_csvs = []
-                    for csv_file in csv_files:
-                        if any(keyword in csv_file.name.lower() for keyword in ['trajectory', 'loop', 'slam', 'pose']):
-                            trajectory_csvs.append(csv_file)
-                    
-                    if trajectory_csvs:
-                        csv_files = trajectory_csvs
-                        break
+            def get_priority(csv_file):
+                for i, name in enumerate(priority_order):
+                    if name in csv_file.name:
+                        return i
+                return len(priority_order)
+            
+            csv_files.sort(key=get_priority)
             
             if csv_files:
                 print(f"📄 Found {len(csv_files)} trajectory CSV files")
@@ -183,9 +142,6 @@ class AriaToVIFTProcessor:
                     return poses
             else:
                 print(f"❌ No trajectory CSV files found in {archive.name}")
-                # List what we did find for debugging
-                all_files = list(temp_dir.rglob("*"))
-                print(f"🔍 Files found in archive: {[f.name for f in all_files[:10]]}")  # Show first 10
                 
             shutil.rmtree(temp_dir, ignore_errors=True)
                 
@@ -417,14 +373,7 @@ class AriaToVIFTProcessor:
         return True
     
     def process_dataset(self, start_index: int = 0, max_sequences: Optional[int] = None, folder_offset: int = 0) -> Dict:
-        """Process multiple AriaEveryday sequences
-        
-        Args:
-            start_index: Starting index in the input directory (default: 0)
-            max_sequences: Maximum number of sequences to process (default: all)
-            folder_offset: Offset for output folder numbering (default: 0)
-                          e.g., offset=117 means first sequence will be saved as '117'
-        """
+        """Process multiple AriaEveryday sequences"""
         print(f"🎯 Processing AriaEveryday Dataset (Quaternion Version)")
         print(f"📁 Input: {self.aria_data_dir}")
         print(f"📁 Output: {self.output_dir}")
@@ -443,8 +392,6 @@ class AriaToVIFTProcessor:
         print(f"📝 Output folders will be numbered from {folder_offset} to {folder_offset + len(sequences) - 1}")
         print("=" * 60)
         
-        print(f"📊 Found {len(sequences)} sequences to process")
-        
         processed_count = 0
         processed_sequences = []
         
@@ -457,7 +404,7 @@ class AriaToVIFTProcessor:
                 processed_sequences.append({
                     'sequence_id': sequence_id,
                     'sequence_name': sequence_path.name,
-                    'frames': len(list((self.output_dir / sequence_id).glob("*.json")))
+                    'frames': actual_frames
                 })
         
         # Save dataset summary
@@ -476,58 +423,30 @@ class AriaToVIFTProcessor:
             json.dump(summary, f, indent=2)
         
         print(f"\n🎉 Processing Complete!")
-        print(f"✅ Successfully processed: {processed_count}/{len(sequences)} sequences")
-        print(f"📁 Output directory: {self.output_dir}")
-        print(f"📄 Dataset summary: {self.output_dir}/dataset_summary.json")
+        print(f"✅ Processed {processed_count}/{len(sequences)} sequences")
         
         return summary
 
+
 def main():
-    parser = argparse.ArgumentParser(description='Process AriaEveryday dataset for VIFT training (Quaternion version)')
-    parser.add_argument('--input-dir', type=str, 
-                      default='data/aria_everyday_subset',
-                      help='Path to AriaEveryday dataset')
-    parser.add_argument('--output-dir', type=str,
-                      default='data/aria_real_train',
-                      help='Output directory for processed data')
-    parser.add_argument('--start-index', type=int, default=None,
-                      help='Starting sequence index (default: process all sequences)')
-    parser.add_argument('--max-sequences', type=int, default=None,
-                      help='Maximum number of sequences to process (default: process all sequences)')
+    parser = argparse.ArgumentParser(description='Process AriaEveryday dataset to VIFT format (Quaternion version)')
+    parser.add_argument('--input-dir', type=str, required=True,
+                        help='Input directory containing AriaEveryday sequences')
+    parser.add_argument('--output-dir', type=str, required=True,
+                        help='Output directory for processed data')
     parser.add_argument('--max-frames', type=int, default=500,
-                      help='Maximum frames per sequence')
-    parser.add_argument('--device', type=str, default='auto',
-                      choices=['auto', 'cpu', 'cuda', 'mps'],
-                      help='Device to use for processing (auto: detect best available)')
+                        help='Maximum frames to extract per sequence (default: 500)')
+    parser.add_argument('--start-index', type=int, default=0,
+                        help='Starting sequence index (default: 0)')
+    parser.add_argument('--max-sequences', type=int, default=None,
+                        help='Maximum number of sequences to process (default: all)')
     parser.add_argument('--folder-offset', type=int, default=0,
-                      help='Offset for output folder numbering (e.g., 117 to start from folder 117)')
+                        help='Offset for output folder numbering (default: 0)')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Device to use: auto, cuda, mps, or cpu (default: auto)')
     
     args = parser.parse_args()
     
-    # Auto-detect sequence range if not provided
-    input_path = Path(args.input_dir)
-    if input_path.exists():
-        all_sequences = sorted([d for d in input_path.iterdir() if d.is_dir()])
-        total_sequences = len(all_sequences)
-        
-        if args.start_index is None:
-            start_index = 0
-        else:
-            start_index = args.start_index
-            
-        if args.max_sequences is None:
-            max_sequences = total_sequences - start_index
-        else:
-            max_sequences = args.max_sequences
-            
-        print(f"📊 Dataset Info:")
-        print(f"   Total sequences available: {total_sequences}")
-        print(f"   Processing range: {start_index} to {start_index + max_sequences}")
-    else:
-        print(f"❌ Input directory not found: {args.input_dir}")
-        return 1
-    
-    # Initialize processor with device support
     processor = AriaToVIFTProcessor(
         aria_data_dir=args.input_dir,
         output_dir=args.output_dir,
@@ -535,20 +454,12 @@ def main():
         device=args.device
     )
     
-    # Process dataset
-    summary = processor.process_dataset(
-        start_index=start_index,
-        max_sequences=max_sequences,
+    processor.process_dataset(
+        start_index=args.start_index,
+        max_sequences=args.max_sequences,
         folder_offset=args.folder_offset
     )
-    
-    print(f"\n🚀 Next steps:")
-    print(f"   1. Create sequence lists for training/testing")
-    print(f"   2. Run latent caching: python generate_all_pretrained_latents_quaternion.py")
-    print(f"   3. Train VIFT: python src/train.py data=aria_vio")
-    
-    return 0
+
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    main()
