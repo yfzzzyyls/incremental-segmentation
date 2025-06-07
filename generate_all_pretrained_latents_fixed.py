@@ -225,10 +225,10 @@ def process_sequence(seq_dir, model, device, window_size=11, stride=1, pose_scal
         window_visual_normalized = window_visual_resized - 0.5
         
         # Prepare IMU data - we need 110 samples (10 per frame)
-        # Simple approach: take first 10 IMU samples from each frame's 33 samples
+        # Take LAST 10 IMU samples from each frame's 33 samples for most recent data
         window_imu_110 = []
         for i in range(window_size):
-            window_imu_110.append(window_imu[i, :10, :])  # Take first 10 samples
+            window_imu_110.append(window_imu[i, -10:, :])  # Take last 10 samples
         window_imu_110 = torch.cat(window_imu_110, dim=0)  # [110, 6]
         
         # Add batch dimension

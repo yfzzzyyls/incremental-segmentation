@@ -218,7 +218,6 @@ def sliding_window_inference_batched(
     window_size: int = 11,
     stride: int = 1,
     pose_scale: float = 100.0,
-    mode: str = 'independent',
     batch_size: int = 32,
     num_gpus: int = 4,
     model_type: str = 'multihead_concat'
@@ -232,9 +231,8 @@ def sliding_window_inference_batched(
         vio_model: Trained VIO model
         device: torch device
         window_size: Window size (default 11)
-        stride: Stride for sliding window (default 1)
+        stride: Stride for sliding window (default 1 for real-time)
         pose_scale: Scale factor for poses
-        mode: 'independent' or 'history' - inference mode
         batch_size: Number of windows to process simultaneously
     
     Returns:
@@ -258,11 +256,9 @@ def sliding_window_inference_batched(
     console.print(f"  Total frames: {num_frames}")
     console.print(f"  Window size: {window_size}")
     console.print(f"  Stride: {stride}")
-    console.print(f"  Mode: {mode}")
+    console.print(f"  Mode: Real-time sliding window")
     console.print(f"  Batch size: {batch_size}")
-    
-    if mode == 'independent':
-        console.print(f"  Aggregation: Middle-priority (frames near window center preferred)")
+    console.print(f"  Prediction: Using only last prediction per window (real AR/VR scenario)")
     
     # Store predictions for each window
     window_predictions = []
@@ -317,10 +313,10 @@ def sliding_window_inference_batched(
         )
         window_visual_normalized = window_visual_resized - 0.5
         
-        # Prepare IMU data (take first 10 samples per frame)
+        # Prepare IMU data (take LAST 10 samples per frame for most recent data)
         window_imu_110 = []
         for i in range(window_size):
-            window_imu_110.append(window_imu[i, :10, :])
+            window_imu_110.append(window_imu[i, -10:, :])  # Last 10 samples
         window_imu_110 = torch.cat(window_imu_110, dim=0)  # [110, 6]
         
         all_windows_visual.append(window_visual_normalized)
@@ -440,37 +436,72 @@ def sliding_window_inference_batched(
     
     console.print(f"  Processed {num_windows} windows in {(num_windows + batch_size * num_gpus - 1) // (batch_size * num_gpus)} batches")
     
-    # Aggregation (same as before)
+    # Real-time aggregation: Sliding window with only the last prediction used
+    # This simulates real AR/VR where we maintain a buffer and predict next frame
     aggregated_poses = np.zeros((num_frames, 7))
     aggregated_poses[:, 3:] = [0, 0, 0, 1]  # Initialize with identity quaternions
     
     frame_counts = np.zeros(num_frames)
     
-    if mode == 'independent':
-        # Mode 1: Middle-priority aggregation
-        quality_scores = np.full(num_frames, -1.0)
-        middle_idx = window_size // 2
-        
-        for (start_idx, end_idx), pred_poses in zip(window_indices, window_predictions):
-            for i in range(window_size):
-                frame_idx = start_idx + i
-                if frame_idx < num_frames:
-                    quality = 1.0 - abs(i - middle_idx) / middle_idx
-                    
-                    if quality > quality_scores[frame_idx]:
-                        aggregated_poses[frame_idx] = pred_poses[i]
-                        quality_scores[frame_idx] = quality
-                    frame_counts[frame_idx] += 1
+    console.print(f"  Using real-time sliding window (last prediction only)")
     
-    else:  # mode == 'history'
-        # For history mode with batching, we need a different approach
-        # For now, use simple last-write-wins
-        for (start_idx, end_idx), pred_poses in zip(window_indices, window_predictions):
+    # Debug tracking
+    frames_with_multiple_predictions = 0
+    total_predictions_used = 0
+    
+    # In real-time AR/VR:
+    # - We maintain a sliding window of 11 frames
+    # - We predict 10 transitions
+    # - We only use the LAST prediction (transition from frame 9→10)
+    # - We slide the window by 1 frame and repeat
+    
+    for (start_idx, end_idx), pred_poses in zip(window_indices, window_predictions):
+        # In this window, we have predictions for frames start_idx to start_idx+10
+        # In real-time, we would only trust and use the last prediction
+        # because it has the most context (all previous frames in the window)
+        
+        if stride == 1:
+            # Real-time mode: only use the last prediction from each window
+            last_frame_idx = start_idx + window_size - 1
+            if last_frame_idx < num_frames:
+                # Check if this frame already has a prediction
+                if frame_counts[last_frame_idx] > 0:
+                    frames_with_multiple_predictions += 1
+                # Use the last prediction (most informed by context)
+                aggregated_poses[last_frame_idx] = pred_poses[-1]
+                frame_counts[last_frame_idx] = 1
+                total_predictions_used += 1
+        else:
+            # Non-overlapping mode: use all predictions from this window
             for i in range(window_size):
                 frame_idx = start_idx + i
                 if frame_idx < num_frames:
                     aggregated_poses[frame_idx] = pred_poses[i]
-                    frame_counts[frame_idx] += 1
+                    frame_counts[frame_idx] = 1
+    
+    # For stride=1, we need to handle the first frames differently
+    # The first window_size-1 frames don't have "last prediction" coverage
+    if stride == 1:
+        # Use predictions from the first window for initial frames
+        first_window_poses = window_predictions[0]
+        for i in range(window_size - 1):
+            if frame_counts[i] == 0:
+                aggregated_poses[i] = first_window_poses[i]
+                frame_counts[i] = 1
+    
+    # Ensure all frames have predictions
+    for i in range(num_frames):
+        if frame_counts[i] == 0 and i > 0:
+            console.print(f"  Warning: Frame {i} has no prediction, using previous frame")
+            aggregated_poses[i] = aggregated_poses[i-1]
+            frame_counts[i] = 1
+    
+    # Debug output
+    console.print(f"\n  Debug: Real-time aggregation statistics:")
+    console.print(f"    - Total predictions used: {total_predictions_used}")
+    console.print(f"    - Frames with multiple predictions: {frames_with_multiple_predictions}")
+    console.print(f"    - Expected for stride=1: each frame uses exactly 1 prediction")
+    console.print(f"    - Frames covered: {np.sum(frame_counts > 0)}/{num_frames}")
     
     # Build absolute trajectory from relative poses
     absolute_trajectory = accumulate_poses(aggregated_poses)
@@ -647,9 +678,11 @@ def calculate_metrics(results, no_alignment=False):
             
             rpe_results[window_name] = {
                 'trans_mean': np.mean(rpe_trans),
+                'trans_rmse': np.sqrt(np.mean(np.square(rpe_trans))),
                 'trans_std': np.std(rpe_trans),
                 'trans_median': np.median(rpe_trans),
                 'rot_mean': np.mean(rpe_rot),
+                'rot_rmse': np.sqrt(np.mean(np.square(rpe_rot))),
                 'rot_std': np.std(rpe_rot),
                 'rot_median': np.median(rpe_rot)
             }
@@ -676,6 +709,9 @@ def calculate_metrics(results, no_alignment=False):
             'translation_magnitude_mm': np.linalg.norm(transform_params['translation']) * 10  # Convert to mm
         }
     
+    # Calculate rotation RMSE
+    rot_rmse_deg = np.sqrt(np.mean(np.square(rot_errors_deg)))
+    
     return {
         # Aligned metrics (for research comparison)
         'ate_mean_mm': ate_errors_aligned_mm.mean(),
@@ -695,6 +731,7 @@ def calculate_metrics(results, no_alignment=False):
         
         # Rotation metrics (from aligned trajectory)
         'rot_mean_deg': rot_errors_deg.mean(),
+        'rot_rmse_deg': rot_rmse_deg,  # Added RMSE for rotation
         'rot_std_deg': rot_errors_deg.std(),
         'rot_median_deg': np.median(rot_errors_deg),
         'rot_95_deg': np.percentile(rot_errors_deg, 95),
@@ -719,10 +756,7 @@ def main():
     parser.add_argument('--processed-dir', type=str, default='data/aria_processed',
                         help='Directory with processed sequences')
     parser.add_argument('--stride', type=int, default=1,
-                        help='Stride for sliding window')
-    parser.add_argument('--mode', type=str, default='independent',
-                        choices=['independent', 'history'],
-                        help='Inference mode: independent or history-based')
+                        help='Stride for sliding window (1 for real-time, >1 for faster non-overlapping)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use')
     parser.add_argument('--batch-size', type=int, default=32,
@@ -828,7 +862,6 @@ def main():
             vio_model=vio_model,
             device=device,
             stride=args.stride,
-            mode=args.mode,
             batch_size=args.batch_size,
             num_gpus=args.num_gpus,
             model_type=model_type
@@ -841,9 +874,9 @@ def main():
         
         # Save individual results
         if len(test_sequences) == 1:
-            output_path = Path(f"inference_results_fixed_seq_{seq_id}_stride_{args.stride}_mode_{args.mode}.npz")
+            output_path = Path(f"inference_results_realtime_seq_{seq_id}_stride_{args.stride}.npz")
         else:
-            output_dir = Path(f"inference_results_fixed_all_stride_{args.stride}_mode_{args.mode}")
+            output_dir = Path(f"inference_results_realtime_all_stride_{args.stride}")
             output_dir.mkdir(exist_ok=True)
             output_path = output_dir / f"seq_{seq_id}.npz"
         
@@ -903,13 +936,18 @@ def main():
         per_seq_table.add_column("Status", style="white")
         
         for m in all_metrics:
-            status = "✅" if m['ate_mean_mm'] < 10.0 else "❌"
+            # Use RMSE values when available
+            ate_value = m.get('ate_rmse_mm', m['ate_mean_mm'])
+            trans_rpe = m['rpe_results']['33ms'].get('trans_rmse', m['rpe_results']['33ms']['trans_mean'])
+            rot_rpe = m['rpe_results']['33ms'].get('rot_rmse', m['rpe_results']['33ms']['rot_mean'])
+            
+            status = "✅" if ate_value < 10.0 else "❌"
             per_seq_table.add_row(
                 m['sequence_id'],
                 f"{m['total_frames']:,}",
-                f"{m['ate_mean_mm']:.2f} mm",
-                f"{m['rpe_results']['33ms']['trans_mean']:.2f} mm",
-                f"{m['rpe_results']['33ms']['rot_mean']:.2f}°",
+                f"{ate_value:.2f} mm",
+                f"{trans_rpe:.2f} mm",
+                f"{rot_rpe:.2f}°",
                 status
             )
         
@@ -982,7 +1020,7 @@ def main():
     
     # Display performance vs standards
     console.print("\n")
-    perf_table = Table(title="Performance Metrics vs Research Benchmarks")
+    perf_table = Table(title="Performance Metrics")
     perf_table.add_column("Metric", style="cyan", width=35)
     perf_table.add_column("Our Model", style="green", width=20)
     perf_table.add_column("Type", style="yellow", width=15)
@@ -1006,10 +1044,11 @@ def main():
     )
     
     # Rotation ATE (moved here as it's also a full trajectory metric)
+    rot_ate_value = metrics.get('rot_rmse_deg', metrics['rot_mean_deg'])
     perf_table.add_row(
         "Rotation ATE",
-        f"{metrics['rot_mean_deg']:.2f} ± {metrics['rot_std_deg']:.2f}°",
-        "Mean",
+        f"{rot_ate_value:.2f} ± {metrics['rot_std_deg']:.2f}°",
+        "RMSE",
         "Total angular drift"
     )
     
@@ -1030,16 +1069,18 @@ def main():
         "",
         ""
     )
+    trans_rpe_1frame = rpe['33ms'].get('trans_rmse', rpe['33ms']['trans_mean'])
+    rot_rpe_1frame = rpe['33ms'].get('rot_rmse', rpe['33ms']['rot_mean'])
     perf_table.add_row(
         "  ├─ Translation",
-        f"{rpe['33ms']['trans_mean']:.2f} ± {rpe['33ms']['trans_std']:.2f} mm",
-        "Mean",
+        f"{trans_rpe_1frame:.2f} ± {rpe['33ms']['trans_std']:.2f} mm",
+        "RMSE",
         "Frame-to-frame consistency"
     )
     perf_table.add_row(
         "  └─ Rotation",
-        f"{rpe['33ms']['rot_mean']:.2f} ± {rpe['33ms']['rot_std']:.2f}°",
-        "Mean",
+        f"{rot_rpe_1frame:.2f} ± {rpe['33ms']['rot_std']:.2f}°",
+        "RMSE",
         "Angular velocity accuracy"
     )
     
@@ -1051,16 +1092,18 @@ def main():
             "",
             ""
         )
+        trans_rpe_1s = rpe['1s'].get('trans_rmse', rpe['1s']['trans_mean'])
+        rot_rpe_1s = rpe['1s'].get('rot_rmse', rpe['1s']['rot_mean'])
         perf_table.add_row(
             "  ├─ Translation",
-            f"{rpe['1s']['trans_mean']:.2f} ± {rpe['1s']['trans_std']:.2f} mm",
-            "Mean",
+            f"{trans_rpe_1s:.2f} ± {rpe['1s']['trans_std']:.2f} mm",
+            "RMSE",
             "1-second drift rate"
         )
         perf_table.add_row(
             "  └─ Rotation",
-            f"{rpe['1s']['rot_mean']:.2f} ± {rpe['1s']['rot_std']:.2f}°",
-            "Mean",
+            f"{rot_rpe_1s:.2f} ± {rpe['1s']['rot_std']:.2f}°",
+            "RMSE",
             "1-second angular drift"
         )
     
@@ -1109,12 +1152,14 @@ def main():
     else:
         console.print("  [yellow]Moderate drift accumulation[/yellow]")
     
-    if args.mode == 'independent':
-        console.print("\n[dim]Note: Using middle-priority aggregation for improved accuracy[/dim]")
+    if args.stride == 1:
+        console.print("\n[dim]Note: Using real-time sliding window (last prediction only)[/dim]")
+    else:
+        console.print(f"\n[dim]Note: Using non-overlapping windows with stride {args.stride}[/dim]")
     
     if len(all_metrics) > 1:
         # Save averaged metrics
-        avg_output_path = Path(f"inference_results_fixed_averaged_stride_{args.stride}_mode_{args.mode}.json")
+        avg_output_path = Path(f"inference_results_realtime_averaged_stride_{args.stride}.json")
         import json
         with open(avg_output_path, 'w') as f:
             # Convert numpy values to Python native types for JSON serialization
@@ -1144,7 +1189,7 @@ def main():
             }
             json.dump(json_metrics, f, indent=2)
         console.print(f"\n✅ Saved averaged results to {avg_output_path}")
-        console.print(f"✅ Individual trajectories saved to inference_results_fixed_all_stride_{args.stride}_mode_{args.mode}/")
+        console.print(f"✅ Individual trajectories saved to inference_results_realtime_all_stride_{args.stride}/")
     else:
         console.print(f"\n✅ Saved results to {output_path}")
         console.print("\n[bold cyan]Visualize trajectory:[/bold cyan]")
