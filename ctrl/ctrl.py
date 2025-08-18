@@ -135,12 +135,14 @@ class MaskReuseController:
             
             # Project gaze to this cached view
             K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
+            # Use current distortion coeffs (assuming same camera model for all frames)
             gaze_in_cached = self._map_to_cached_view(
                 gaze_3d,
                 current.pose,
                 cached_frame.pose,
                 cached_frame.rgb.shape[:2],
-                K_cached
+                K_cached,
+                current.distortion_coeffs  # Pass distortion for fisheye projection
             )
             
             # Skip if gaze is out of bounds
@@ -375,10 +377,13 @@ class MaskReuseController:
         current_pose: np.ndarray,
         cached_pose: np.ndarray,
         cached_shape: Tuple[int, int],
-        intrinsics: np.ndarray
+        intrinsics: np.ndarray,
+        distortion_coeffs: Optional[np.ndarray] = None
     ) -> Optional[Tuple[int, int]]:
         """
         Map 3D point from current to cached view.
+        
+        Supports both pinhole and fisheye projection models.
         
         Args:
             point_3d: 3D point in current camera coordinates
@@ -386,6 +391,7 @@ class MaskReuseController:
             cached_pose: 4x4 world->cached camera transform
             cached_shape: (H, W) of cached image
             intrinsics: 3x3 K matrix for cached camera
+            distortion_coeffs: Optional fisheye distortion coefficients
             
         Returns:
             Pixel coordinates in cached view or None if out of bounds.
@@ -400,16 +406,56 @@ class MaskReuseController:
         # World to cached camera (inverse of camera->world)
         point_cached = np.linalg.inv(cached_pose) @ point_world  # world→cached cam
         
-        # Project with cached intrinsics
+        # Check if behind camera
         Z = point_cached[2]
         if Z <= 0:
             return None
         
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-        
-        x = int(fx * point_cached[0] / Z + cx)
-        y = int(fy * point_cached[1] / Z + cy)
+        # Project to 2D pixel coordinates
+        if distortion_coeffs is not None and len(distortion_coeffs) >= 4:
+            # FISHEYE PROJECTION (Kannala-Brandt model)
+            X, Y = point_cached[0], point_cached[1]
+            
+            # Convert to spherical coordinates
+            r = np.sqrt(X**2 + Y**2)
+            theta = np.arctan2(r, Z)  # Angle from optical axis
+            
+            if r > 1e-8:  # Avoid division by zero
+                # Direction on normalized plane
+                x_norm = X / r
+                y_norm = Y / r
+                
+                # Apply Kannala-Brandt distortion
+                theta2 = theta * theta
+                theta4 = theta2 * theta2
+                theta6 = theta4 * theta2
+                theta8 = theta6 * theta2
+                
+                k1, k2, k3, k4 = distortion_coeffs[:4]
+                theta_d = theta * (1 + k1*theta2 + k2*theta4 + k3*theta6 + k4*theta8)
+                
+                # Distorted normalized coordinates
+                x_distorted = theta_d * x_norm
+                y_distorted = theta_d * y_norm
+            else:
+                # Point is on optical axis
+                x_distorted = 0
+                y_distorted = 0
+            
+            # Convert to pixels
+            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+            cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+            
+            x = int(fx * x_distorted + cx)
+            y = int(fy * y_distorted + cy)
+            
+        else:
+            # PINHOLE PROJECTION (fallback)
+            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+            cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+            
+            x = int(fx * point_cached[0] / Z + cx)
+            y = int(fy * point_cached[1] / Z + cy)
         
         # Check bounds
         h, w = cached_shape
