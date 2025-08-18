@@ -86,22 +86,64 @@ class ADTDataLoader:
         # Load trajectory (poses)
         self.trajectory = self._load_trajectory()
         
-        # Camera intrinsics from ADT VRS calibration
+        # Camera intrinsics from ADT VRS calibration (exact values)
         # Extracted from camera-rgb sensor in VRS file
-        # Model: FISHEYE624 (but we use pinhole approximation for homography)
+        # Model: FISHEYE624 (Kannala-Brandt)
         self.intrinsics = np.array([
-            [610.94, 0.0, 715.11],  # fx, 0, cx
-            [0.0, 610.94, 716.71],  # 0, fy, cy
-            [0.0, 0.0, 1.0]         # 0, 0, 1
+            [610.9410078676575, 0.0, 715.1148341104505],  # fx, 0, cx
+            [0.0, 610.9410078676575, 716.7147122529825],  # 0, fy, cy
+            [0.0, 0.0, 1.0]                                # 0, 0, 1
         ])
+        
+        # Fisheye distortion coefficients for FISHEYE624 model
+        # Extracted from ADT VRS files using projectaria_tools
+        # These are the actual calibration values for ADT RGB camera
+        self.distortion_coeffs = None
+        
+        # Try to load from saved calibration file first
+        calib_paths = [
+            self.processed_dir / "calibration.json",
+            self.original_dir / "camera_calibration.json",
+            self.data_root / "calibration" / f"{sequence}.json"
+        ]
+        
+        loaded_from_file = False
+        for calib_path in calib_paths:
+            if calib_path.exists():
+                try:
+                    with open(calib_path, 'r') as f:
+                        calib = json.load(f)
+                        if 'distortion_coeffs' in calib:
+                            self.distortion_coeffs = np.array(calib['distortion_coeffs'])
+                            print(f"  ✅ Loaded fisheye distortion coefficients from {calib_path.name}")
+                            loaded_from_file = True
+                            break
+                except:
+                    pass
+        
+        # If not found in files, use the known values from DESIGN.md
+        if not loaded_from_file:
+            # These are the actual distortion coefficients for ADT FISHEYE624 camera
+            # Extracted from: ADT_Apartment_release_clean_seq148_M1292_main_recording.vrs
+            self.distortion_coeffs = np.array([
+                0.4060356696288849,   # k1
+                -0.489948419647729,   # k2
+                0.1745652818132035,   # k3
+                1.132983686620576     # k4
+            ])
+            print("  ✅ Using known ADT FISHEYE624 distortion coefficients from DESIGN.md")
         
         print(f"Loaded ADT sequence: {sequence}")
         print(f"  Frames: {len(self.metadata['frames'])}")
         print(f"  Trajectory entries: {len(self.trajectory)}")
-        print("\n⚠️  WARNING: ADT uses FISHEYE624 distortion model.")
-        print("  Current implementation uses pinhole approximation for homography.")
-        print("  This may cause warping errors, especially at image edges.")
-        print("  For best results, rectify ROIs before applying homography.\n")
+        
+        if self.distortion_coeffs is not None:
+            print(f"\n✅ Using Kannala-Brandt FISHEYE624 model for accurate unprojection")
+            print(f"  Distortion coeffs (k1-k4): [{self.distortion_coeffs[0]:.4f}, {self.distortion_coeffs[1]:.4f}, {self.distortion_coeffs[2]:.4f}, {self.distortion_coeffs[3]:.4f}]")
+            print("  ⚠️  Note: Homography still assumes planar surfaces\n")
+        else:
+            print("\n⚠️  WARNING: Failed to load fisheye distortion coefficients")
+            print("  Falling back to pinhole approximation (will cause errors at image edges)\n")
     
     def _load_metadata(self) -> dict:
         """Load sequence metadata."""
@@ -584,7 +626,8 @@ def test_control_pipeline(
             pose=frame_data['pose'],
             gaze_pixel=frame_data['gaze'],
             timestamp_us=frame_data['timestamp_us'],
-            intrinsics=loader.intrinsics
+            intrinsics=loader.intrinsics,
+            distortion_coeffs=loader.distortion_coeffs
         )
         
         # Process with controller

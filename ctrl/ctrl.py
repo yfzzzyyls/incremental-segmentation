@@ -32,6 +32,7 @@ class ControlInput:
     gaze_pixel: Tuple[int, int]  # Current gaze point in pixels
     timestamp_us: float
     intrinsics: np.ndarray  # 3x3 camera intrinsics matrix
+    distortion_coeffs: Optional[np.ndarray] = None  # Fisheye distortion coefficients [k1, k2, k3, k4]
 
 
 @dataclass
@@ -92,6 +93,12 @@ class MaskReuseController:
         """
         Main control logic: decide SEG vs REUSE and perform projection.
         
+        CORRECTED LOGIC:
+        1. First project gaze to 3D
+        2. Find ALL cached frames where gaze hits a mask
+        3. Among those candidates, pick best by pose similarity
+        4. Validate and warp the selected mask
+        
         Args:
             current: Current frame input data
             cached_frames: Dictionary of cached frames
@@ -99,82 +106,100 @@ class MaskReuseController:
         Returns:
             ControlOutput with decision and projected mask if applicable
         """
-        # Step 1: Find best matching cached frame
-        best_match = self._find_best_match(current, cached_frames)
-        
-        if best_match is None:
+        if not cached_frames:
             return ControlOutput(
                 decision="SEG",
-                reason="No suitable cached frame found"
+                reason="No cached frames available"
             )
         
-        cached_frame = cached_frames[best_match]
-        
-        # Step 2: Validate preconditions
-        if not self._validate_preconditions(current, cached_frame):
-            return ControlOutput(
-                decision="SEG",
-                reason="Preconditions not met"
-            )
-        
-        # Step 3: Project gaze to 3D
+        # Step 1: Project current gaze to 3D
         gaze_3d = self._project_gaze_to_3d(
             current.gaze_pixel,
             current.depth,
-            current.intrinsics
+            current.intrinsics,
+            current.distortion_coeffs
         )
         
         if gaze_3d is None:
             return ControlOutput(
                 decision="SEG",
-                reason="Invalid gaze projection"
+                reason="Invalid gaze projection (no depth at gaze)"
             )
         
-        # Step 4: Map gaze to cached view
-        # Use cached intrinsics if available
-        K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
-        gaze_in_cached = self._map_to_cached_view(
-            gaze_3d,
-            current.pose,
-            cached_frame.pose,
-            cached_frame.rgb.shape[:2],
-            K_cached
-        )
+        # Step 2: Find ALL cached frames where gaze lands in a mask
+        candidates = []
+        for frame_id, cached_frame in cached_frames.items():
+            # Check basic preconditions
+            if not self._validate_preconditions(current, cached_frame):
+                continue
+            
+            # Project gaze to this cached view
+            K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
+            gaze_in_cached = self._map_to_cached_view(
+                gaze_3d,
+                current.pose,
+                cached_frame.pose,
+                cached_frame.rgb.shape[:2],
+                K_cached
+            )
+            
+            # Skip if gaze is out of bounds
+            if gaze_in_cached is None:
+                continue
+            
+            # Check if gaze hits the mask
+            if self._gaze_in_mask(gaze_in_cached, cached_frame.mask):
+                # Compute pose similarity score for ranking
+                T_rel = np.linalg.inv(current.pose) @ cached_frame.pose
+                translation_dist = np.linalg.norm(T_rel[:3, 3])
+                rotation_angle = np.arccos(np.clip((np.trace(T_rel[:3, :3]) - 1) / 2, -1, 1))
+                pose_score = np.exp(-translation_dist) * np.exp(-rotation_angle)
+                
+                candidates.append({
+                    'frame_id': frame_id,
+                    'frame': cached_frame,
+                    'gaze_in_cached': gaze_in_cached,
+                    'pose_score': pose_score,
+                    'translation_dist': translation_dist,
+                    'rotation_angle': rotation_angle
+                })
         
-        if gaze_in_cached is None:
+        # Step 3: No candidates where gaze hits a mask
+        if not candidates:
             return ControlOutput(
                 decision="SEG",
-                reason="Gaze out of cached view bounds"
+                reason="Gaze does not hit any cached masks"
             )
         
-        # Step 5: Check if gaze falls within cached mask
-        if not self._gaze_in_mask(gaze_in_cached, cached_frame.mask):
-            return ControlOutput(
-                decision="SEG",
-                reason="Gaze not in cached mask",
-                cached_frame_id=best_match
-            )
+        # Step 4: Select best candidate by pose similarity
+        best_candidate = max(candidates, key=lambda x: x['pose_score'])
+        cached_frame = best_candidate['frame']
+        best_match = best_candidate['frame_id']
         
-        # Step 6: Use cached plane parameters or fit if missing
+        # Log why we chose this frame (for debugging)
+        print(f"  Selected cache frame {best_match}: pose_score={best_candidate['pose_score']:.3f}, "
+              f"trans={best_candidate['translation_dist']:.2f}m, rot={np.degrees(best_candidate['rotation_angle']):.1f}°")
+        
+        # Step 5: Get or compute plane parameters
         if cached_frame.plane_params is not None:
             plane_params = cached_frame.plane_params
         else:
-            # Fallback: fit plane if not cached (use cached intrinsics)
+            # Fallback: fit plane if not cached
             K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
             plane_params = self._fit_plane_to_mask(
                 cached_frame.mask,
                 cached_frame.depth,
-                K_cached  # ✅ Use cached camera intrinsics
+                K_cached
             )
             
             if plane_params is None:
                 return ControlOutput(
                     decision="SEG",
-                    reason="Plane fitting failed"
+                    reason="Plane fitting failed",
+                    cached_frame_id=best_match
                 )
         
-        # Step 7: Compute homography and warp mask
-        # Use cached intrinsics if available, otherwise assume same camera
+        # Step 6: Compute homography and warp mask
         K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
         homography = self._compute_planar_homography(
             plane_params,
@@ -187,12 +212,13 @@ class MaskReuseController:
         if homography is None:
             return ControlOutput(
                 decision="SEG",
-                reason="Homography computation failed"
+                reason="Homography computation failed",
+                cached_frame_id=best_match
             )
         
         warped_mask = self._warp_mask(cached_frame.mask, homography, current.rgb.shape[:2])
         
-        # Step 8: Validate warped mask
+        # Step 7: Validate warped mask
         validation_result = self._validate_warped_mask(
             warped_mask,
             current.rgb,
@@ -213,7 +239,7 @@ class MaskReuseController:
             decision="REUSE",
             mask=warped_mask,
             confidence=validation_result['confidence'],
-            reason="All validation checks passed",
+            reason=f"Reused from frame {best_match} (found {len(candidates)} candidates)",
             cached_frame_id=best_match
         )
     
@@ -223,9 +249,14 @@ class MaskReuseController:
         cached_frames: Dict[int, CachedFrame]
     ) -> Optional[int]:
         """
-        Find best matching cached frame based on pose and appearance.
+        [DEPRECATED - Logic moved to main process method]
         
-        Returns frame_id of best match or None.
+        This method is kept for backward compatibility but is no longer used.
+        The new logic in process() first checks which cached masks contain
+        the gaze point, then selects the best one by pose similarity.
+        
+        Old behavior: Found best frame by pose similarity alone,
+        without checking if gaze hits the mask first.
         """
         if not cached_frames:
             return None
@@ -270,12 +301,22 @@ class MaskReuseController:
         self,
         gaze_pixel: Tuple[int, int],
         depth: np.ndarray,
-        intrinsics: np.ndarray
+        intrinsics: np.ndarray,
+        distortion_coeffs: Optional[np.ndarray] = None
     ) -> Optional[np.ndarray]:
         """
         Project 2D gaze point to 3D using depth.
         
-        Returns 3D point in camera coordinates or None.
+        Supports both pinhole and Kannala-Brandt fisheye models.
+        
+        Args:
+            gaze_pixel: (x, y) pixel coordinates
+            depth: Depth map in meters
+            intrinsics: 3x3 camera matrix K
+            distortion_coeffs: Optional fisheye distortion [k1, k2, k3, k4]
+            
+        Returns:
+            3D point in camera coordinates or None.
         """
         x, y = gaze_pixel
         
@@ -289,14 +330,44 @@ class MaskReuseController:
         if z <= 0 or np.isnan(z) or np.isinf(z):
             return None
         
-        # Unproject to 3D
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+        # Case 1: Fisheye camera (Kannala-Brandt model)
+        if distortion_coeffs is not None and len(distortion_coeffs) >= 4:
+            # Convert pixel to array format for cv2
+            pixel_array = np.array([[[x, y]]], dtype=np.float32)
+            
+            # Undistort the point to get normalized coordinates
+            # This gives us the ray direction in normalized camera coordinates
+            undistorted = cv2.fisheye.undistortPoints(
+                pixel_array,
+                K=intrinsics,
+                D=distortion_coeffs[:4].reshape((4, 1))  # Use first 4 coeffs
+            )
+            
+            # undistorted contains normalized coordinates (x/z, y/z)
+            x_norm = undistorted[0, 0, 0]
+            y_norm = undistorted[0, 0, 1]
+            
+            # The ray direction is [x_norm, y_norm, 1]
+            # We need to scale it to reach depth z
+            # In fisheye, the depth is along the ray, not just z-coordinate
+            ray_norm = np.sqrt(x_norm**2 + y_norm**2 + 1)
+            
+            # Scale ray to reach the measured depth
+            # (assuming depth is measured along z-axis, not along ray)
+            x_3d = x_norm * z
+            y_3d = y_norm * z
+            z_3d = z
+            
+        # Case 2: Pinhole camera (fallback)
+        else:
+            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+            cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+            
+            x_3d = (x - cx) * z / fx
+            y_3d = (y - cy) * z / fy
+            z_3d = z
         
-        x_3d = (x - cx) * z / fx
-        y_3d = (y - cy) * z / fy
-        
-        return np.array([x_3d, y_3d, z])
+        return np.array([x_3d, y_3d, z_3d])
     
     def _map_to_cached_view(
         self,

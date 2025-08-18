@@ -594,23 +594,68 @@ Location: /mnt/ssd_ext/incSeg-data/
 ## 2. CAMERA CALIBRATION
 
 ### 2.1 RGB Camera Intrinsics
-**Source**: VRS file device calibration
+**Source**: Extracted from VRS file device calibration
 **Sensor Label**: `camera-rgb`
-**Model**: FISHEYE624 (Fisheye distortion model)
+**Model**: FISHEYE624 (Kannala-Brandt fisheye model)
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | Resolution | 1408 × 1408 | Image dimensions in pixels |
-| fx | 610.94 | Focal length X (pixels) |
-| fy | 610.94 | Focal length Y (pixels) |
-| cx | 715.11 | Principal point X (pixels) |
-| cy | 716.71 | Principal point Y (pixels) |
+| fx | 610.9410078676575 | Focal length X (pixels) |
+| fy | 610.9410078676575 | Focal length Y (pixels) |
+| cx | 715.1148341104505 | Principal point X (pixels) |
+| cy | 716.7147122529825 | Principal point Y (pixels) |
 
 **K Matrix (3×3)**:
 ```
 [610.94,   0.00, 715.11]
 [  0.00, 610.94, 716.71]
 [  0.00,   0.00,   1.00]
+```
+
+### 2.2 Fisheye Distortion Coefficients
+**Model**: Kannala-Brandt FISHEYE624
+**Extracted from**: ADT_Apartment_release_clean_seq148_M1292_main_recording.vrs
+
+**Radial Distortion Coefficients (k1-k4)**:
+```
+k1 = 0.4060356696288849
+k2 = -0.489948419647729
+k3 = 0.1745652818132035
+k4 = 1.132983686620576
+```
+
+**Extended Coefficients (k5-k6)**:
+```
+k5 = -1.701635218233742
+k6 = 0.6511555293441647
+```
+
+**Tangential Distortion (p1-p2)**:
+```
+p1 = 0.0006211469747214578
+p2 = 1.932200015697112e-05
+```
+
+**Thin Prism (s1-s4)**:
+```
+s1 = -1.485525650871087e-05
+s2 = 0.0002601225712292815
+s3 = -0.0006582109778598294
+s4 = 3.761395141407565e-05
+```
+
+**Usage in OpenCV**:
+```python
+# For cv2.fisheye functions, use first 4 coefficients
+distortion_coeffs = np.array([0.406036, -0.489948, 0.174565, 1.132984])
+
+# Undistort a point
+undistorted = cv2.fisheye.undistortPoints(
+    points, 
+    K=intrinsics,
+    D=distortion_coeffs.reshape((4,1))
+)
 ```
 
 ### 2.2 Camera-Device Transform
