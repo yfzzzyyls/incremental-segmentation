@@ -546,3 +546,378 @@ The planar pipeline is memory-efficient (4 floats vs 1M depths) while handling m
 - Piecewise planar: Sinha et al., "Piecewise Planar Stereo for Image-based Rendering"
 - Fisheye rectification: `cv2.fisheye.initUndistortRectifyMap()` + `cv2.remap()` [tutorial](https://docs.opencv.org/master/db/d58/group__calib3d__fisheye.html)
 - Basic homogeneous coordinates: [OpenCV camera calibration tutorial](https://docs.opencv.org/master/d9/d0c/group__calib3d.html)
+
+---
+
+# PART 2: ADT DATASET FORMAT DOCUMENTATION
+## Complete Technical Specification
+
+Dataset: Apartment_release_clean_seq148_M1292
+Location: /mnt/ssd_ext/incSeg-data/
+
+---
+
+## 1. DIRECTORY STRUCTURE
+
+### 1.1 Original ADT Data (`/adt/test/[sequence]/`)
+```
+├── ADT_[sequence]_main_recording.vrs      # Main VRS with RGB, IMU, calibration
+├── ADT_[sequence]_depth.zip               # Depth images VRS (zipped)
+├── ADT_[sequence]_segmentation.zip        # Segmentation VRS (zipped)
+├── ADT_[sequence]_main_groundtruth.zip    # Ground truth data
+├── depth_images.vrs                       # Extracted depth VRS
+├── segmentations.vrs                      # Extracted segmentation VRS
+├── aria_trajectory.csv                    # 6DOF poses + gravity
+├── eyegaze.csv                           # Raw gaze angles
+├── 2d_bounding_box.csv                   # 2D object bounding boxes
+├── 3d_bounding_box.csv                   # 3D object bounding boxes
+├── scene_objects.csv                     # Scene object descriptions
+├── instances.json                        # Instance definitions
+└── metadata.json                         # Sequence metadata
+```
+
+### 1.2 Processed Data (`/processed_adt/test/[sequence]/`)
+```
+├── rgb/                                  # PNG images (1408x1408)
+│   └── frame_NNNNNN.png
+├── depth/                                # Depth as NPZ (1408x1408)
+│   └── frame_NNNNNN.npz
+├── gaze/                                 # Gaze pixel coordinates
+│   └── frame_NNNNNN.json
+├── segmentation/                         # Instance segmentation
+│   └── frame_NNNNNN.npz
+└── metadata.json                         # Frame index mapping
+```
+
+---
+
+## 2. CAMERA CALIBRATION
+
+### 2.1 RGB Camera Intrinsics
+**Source**: VRS file device calibration
+**Sensor Label**: `camera-rgb`
+**Model**: FISHEYE624 (Fisheye distortion model)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Resolution | 1408 × 1408 | Image dimensions in pixels |
+| fx | 610.94 | Focal length X (pixels) |
+| fy | 610.94 | Focal length Y (pixels) |
+| cx | 715.11 | Principal point X (pixels) |
+| cy | 716.71 | Principal point Y (pixels) |
+
+**K Matrix (3×3)**:
+```
+[610.94,   0.00, 715.11]
+[  0.00, 610.94, 716.71]
+[  0.00,   0.00,   1.00]
+```
+
+### 2.2 Camera-Device Transform
+**T_Device_Camera** (4×4 transformation matrix)
+- Translation and rotation from device center to RGB camera
+- Available in VRS calibration
+
+### 2.3 Other Cameras in System
+| Camera | Resolution | Purpose |
+|--------|------------|---------|
+| camera-slam-left | N/A | SLAM tracking |
+| camera-slam-right | N/A | SLAM tracking |
+| camera-et-left | N/A | Eye tracking |
+| camera-et-right | N/A | Eye tracking |
+
+---
+
+## 3. POSE DATA FORMAT
+
+### 3.1 Source File: `aria_trajectory.csv`
+
+| Column | Type | Units | Description |
+|--------|------|-------|-------------|
+| graph_uid | string | - | Unique graph identifier |
+| tracking_timestamp_us | int64 | microseconds | Tracking timestamp |
+| utc_timestamp_ns | int64 | nanoseconds | UTC timestamp |
+| tx_world_device | float64 | meters | Device X position in world |
+| ty_world_device | float64 | meters | Device Y position in world |
+| tz_world_device | float64 | meters | Device Z position in world |
+| qx_world_device | float64 | - | Quaternion X (world to device) |
+| qy_world_device | float64 | - | Quaternion Y (world to device) |
+| qz_world_device | float64 | - | Quaternion Z (world to device) |
+| qw_world_device | float64 | - | Quaternion W (world to device) |
+| device_linear_velocity_x_device | float64 | m/s | Linear velocity X in device frame |
+| device_linear_velocity_y_device | float64 | m/s | Linear velocity Y in device frame |
+| device_linear_velocity_z_device | float64 | m/s | Linear velocity Z in device frame |
+| angular_velocity_x_device | float64 | rad/s | Angular velocity X |
+| angular_velocity_y_device | float64 | rad/s | Angular velocity Y |
+| angular_velocity_z_device | float64 | rad/s | Angular velocity Z |
+| gravity_x_world | float64 | m/s² | Gravity X in world frame |
+| gravity_y_world | float64 | m/s² | Gravity Y in world frame |
+| gravity_z_world | float64 | m/s² | Gravity Z in world frame |
+| quality_score | float64 | - | Tracking quality (0-1) |
+
+### 3.2 Pose Convention
+- **Format**: Camera-to-world (T_world_camera)
+- **Interpretation**: `tx_world_device` = device position in world coordinates
+- **Quaternion Order**: (qw, qx, qy, qz) - scalar first
+- **To get world-to-camera**: Invert the transformation
+
+### 3.3 Example Pose (Frame 100)
+```
+Position: (-0.661, 1.563, 1.407) meters
+Quaternion: (-0.746, -0.026, -0.021, 0.665)
+Gravity: (0.000, -9.810, 0.000) m/s²
+```
+
+---
+
+## 4. DEPTH DATA FORMAT
+
+### 4.1 Storage Format
+| Aspect | Specification |
+|--------|--------------|
+| File Format | NPZ (compressed numpy) |
+| Array Key | 'depth' |
+| Resolution | 1408 × 1408 |
+| Data Type | uint16 |
+| Units | **millimeters** |
+| Invalid Value | 0 |
+| Valid Range | 906 - 7573 mm (0.906 - 7.573 meters) |
+
+### 4.2 Usage
+```python
+depth_data = np.load('frame_NNNNNN.npz')
+depth_mm = depth_data['depth']  # uint16, millimeters
+depth_m = depth_mm.astype(np.float32) / 1000.0  # Convert to meters
+```
+
+---
+
+## 5. RGB DATA FORMAT
+
+| Aspect | Specification |
+|--------|--------------|
+| File Format | PNG |
+| Resolution | 1408 × 1408 |
+| Channels | 3 (RGB) |
+| Data Type | uint8 |
+| Color Space | RGB |
+| Rectification | Unknown (likely rectified) |
+
+---
+
+## 6. SEGMENTATION DATA FORMAT
+
+### 6.1 Storage Format
+| Aspect | Specification |
+|--------|--------------|
+| Source | segmentations.vrs → NPZ files |
+| File Format | NPZ (compressed numpy) |
+| Array Key | 'segmentation' |
+| Resolution | 1408 × 1408 |
+| Data Type | uint64 |
+| Background ID | 0 |
+| Instance IDs | 1 - N (persistent across frames) |
+
+### 6.2 Instance Information
+- Instance definitions in `instances.json`
+- Typically 40-60 unique instances per frame
+- Instance IDs are stable across sequence
+
+---
+
+## 7. GAZE DATA FORMAT
+
+### 7.1 Raw Gaze (`eyegaze.csv`)
+| Column | Type | Units | Description |
+|--------|------|-------|-------------|
+| tracking_timestamp_us | int64 | microseconds | Timestamp |
+| yaw_rads_cpf | float64 | radians | Yaw angle (cyclopean frame) |
+| pitch_rads_cpf | float64 | radians | Pitch angle (cyclopean frame) |
+| depth_m | float64 | meters | Gaze depth (often 0/invalid) |
+| yaw_low_rads_cpf | float64 | radians | Low confidence yaw |
+| pitch_low_rads_cpf | float64 | radians | Low confidence pitch |
+| yaw_high_rads_cpf | float64 | radians | High confidence yaw |
+| pitch_high_rads_cpf | float64 | radians | High confidence pitch |
+
+### 7.2 Processed Gaze (`gaze/frame_NNNNNN.json`)
+```json
+{
+  "timestamp_us": 18617571984,
+  "pitch_rad": -0.359206,
+  "yaw_rad": 0.251812,
+  "x_pixel": 861,        // Gaze X in RGB image
+  "y_pixel": 475,        // Gaze Y in RGB image
+  "time_diff_ms": 0.089  // Time diff from RGB frame
+}
+```
+
+---
+
+## 8. TIMESTAMP ALIGNMENT
+
+### 8.1 Time Domains
+| Data Source | Time Domain | Units |
+|-------------|------------|-------|
+| RGB frames | Device time | nanoseconds |
+| Depth frames | Device time | nanoseconds |
+| Gaze | Device time | microseconds |
+| Pose | Device time | microseconds |
+
+### 8.2 Synchronization
+- RGB and depth pre-aligned in metadata.json
+- Typical RGB-depth offset: ~0.1 ms
+- Pose matched to RGB by nearest timestamp
+- Gaze interpolated to RGB timestamp
+
+### 8.3 Example Frame Timing (Frame 100)
+```
+RGB timestamp:   18617571894875 ns
+Depth timestamp: 18617571988000 ns
+Pose timestamp:  18617571988000 ns
+Gaze timestamp:  18617571984000 ns
+Max time diff:   0.093 ms
+```
+
+---
+
+## 9. IMU DATA
+
+### 9.1 Available IMUs
+| Sensor | Location | Purpose |
+|--------|----------|---------|
+| imu-left | Left side | Motion tracking |
+| imu-right | Right side | Motion tracking |
+
+### 9.2 IMU-Camera Transform
+- T_Camera_IMU available from VRS calibration
+- Computed as: inv(T_Device_Camera) @ T_Device_IMU
+
+---
+
+## 10. METADATA FILES
+
+### 10.1 Original metadata.json
+```json
+{
+  "gt_creation_time": "05/30/2023-13:44:48",
+  "scene": "Apartment",
+  "is_multi_person": false,
+  "num_skeletons": 0,
+  "timecode_enabled": 1,
+  "gt_time_domain": "DEVICE_CAPTURE",
+  "dataset_name": "ADT_2023",
+  "dataset_version": "2.0",
+  "serial": "1WM103600M1292",
+  "concurrent_sequence": ""
+}
+```
+
+### 10.2 Processed metadata.json
+```json
+{
+  "sequence": "Apartment_release_clean_seq148_M1292",
+  "num_frames": 2864,
+  "subsample": 1,
+  "rgb_shape": [1408, 1408, 3],
+  "depth_shape": [1408, 1408],
+  "has_gaze": true,
+  "frames": [
+    {
+      "index": 0,
+      "rgb_index": 324,
+      "depth_index": 0,
+      "rgb_timestamp_ns": 18614239088587,
+      "depth_timestamp_ns": 18614239188000,
+      "time_diff_ms": 0.099413,
+      "rgb": "frame_000000.png",
+      "depth": "frame_000000.npz",
+      "gaze": "frame_000000.json",
+      "has_gaze": true
+    }
+  ]
+}
+```
+
+---
+
+## 11. COORDINATE SYSTEMS
+
+### 11.1 World Coordinate System
+- Gravity aligned: Y-axis points up (against gravity)
+- Gravity vector: (0, -9.81, 0) m/s²
+
+### 11.2 Camera Coordinate System
+- Convention: Unknown (typical: Z forward, X right, Y down)
+- Origin: Optical center of RGB camera
+
+### 11.3 Image Coordinate System
+- Origin: Top-left corner (0, 0)
+- X: Right (0 to 1407)
+- Y: Down (0 to 1407)
+
+---
+
+## 12. DATA STATISTICS
+
+| Metric | Value |
+|--------|-------|
+| Total frames | 2864 |
+| Duration | ~95.4 seconds |
+| Frame rate | ~30 FPS |
+| RGB resolution | 1408 × 1408 |
+| Depth resolution | 1408 × 1408 |
+| Typical depth range | 0.9 - 7.5 meters |
+| Unique instances | ~50-60 per frame |
+| File sizes | RGB: ~500KB, Depth: ~75KB, Seg: ~75KB |
+
+---
+
+## 13. KNOWN ISSUES & NOTES
+
+1. **Depth units**: Stored as millimeters (uint16), must convert to meters
+2. **Fisheye distortion**: RGB uses FISHEYE624 model, may need rectification
+3. **Missing in processed_adt**: Camera intrinsics, IMU data, raw VRS calibration
+4. **Pose convention**: Camera-to-world based on column naming
+5. **Instance IDs**: uint64, can be very large numbers
+6. **Gravity**: Available in trajectory, useful for plane fitting
+
+---
+
+## 14. CODE USAGE EXAMPLES
+
+### Loading a frame with all data:
+```python
+# Load RGB
+rgb = cv2.imread('rgb/frame_000100.png')
+rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+
+# Load depth (convert to meters)
+depth_data = np.load('depth/frame_000100.npz')
+depth_m = depth_data['depth'].astype(np.float32) / 1000.0
+
+# Load segmentation
+seg_data = np.load('segmentation/frame_000100.npz')
+segmentation = seg_data['segmentation']
+
+# Load gaze
+with open('gaze/frame_000100.json') as f:
+    gaze = json.load(f)
+gaze_pixel = (gaze['x_pixel'], gaze['y_pixel'])
+
+# Load pose from trajectory
+traj = pd.read_csv('aria_trajectory.csv')
+pose_row = traj.iloc[100]
+T_world_camera = quaternion_to_matrix(
+    pose_row['qw_world_device'],
+    pose_row['qx_world_device'],
+    pose_row['qy_world_device'],
+    pose_row['qz_world_device'],
+    pose_row['tx_world_device'],
+    pose_row['ty_world_device'],
+    pose_row['tz_world_device']
+)
+```
+
+---
+
+*Documentation compiled from ADT dataset version 2.0, sequence Apartment_release_clean_seq148_M1292*
