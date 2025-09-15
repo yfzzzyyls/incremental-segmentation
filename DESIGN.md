@@ -1,7 +1,28 @@
 # Mask Reuse Pipeline: Detailed Step-by-Step Analysis
 
 ## Overview
-This document provides a comprehensive analysis of each step in the mask reuse pipeline, with concrete examples and failure cases that would occur without each logical step.
+This document provides a comprehensive analysis of the CORRECTED mask reuse pipeline implementation, including fisheye camera model support and proper control flow.
+
+## Critical Updates (December 2024)
+
+### 1. **Fisheye Camera Model**
+- ADT uses FISHEYE624 (Kannala-Brandt) model, NOT pinhole
+- Distortion coefficients: k1=0.406, k2=-0.490, k3=0.175, k4=1.133
+- Must use `cv2.fisheye.undistortPoints()` for unprojection
+- Must use `cv2.fisheye.projectPoints()` for projection
+
+### 2. **Control Flow Fix**  
+- **OLD (WRONG)**: Find best pose match → check if gaze in mask → often fails
+- **NEW (CORRECT)**: Project gaze to ALL cached views → find masks containing gaze → pick best by pose
+
+### 3. **Pose Convention**
+- ADT provides T_world_camera (camera-to-world transforms)
+- Must transpose quaternion rotation matrix for correct convention
+- Plane normal must be normalized with d < 0 for consistency
+
+### 4. **Performance Optimization**
+- Only warp mask bounding box, not full 1408×1408 image
+- Target: <10ms for mask reuse decision
 
 ---
 
@@ -124,91 +145,94 @@ H @ rectified_point  # Valid homography transformation
 ---
 
 ## Step 1: Get Inputs
-**What it does:** Gathers all necessary data for the pipeline.
+**What it does:** Gathers all necessary data INCLUDING fisheye calibration.
 
-**Concrete Example:**
+**Required Inputs:**
 ```python
-# Camera intrinsics (Quest 3 example)
-K = [[600,   0, 640],  # fx, 0, cx
-     [  0, 600, 360],  # 0, fy, cy
-     [  0,   0,   1]]  # 0, 0, 1
+# Camera intrinsics from VRS calibration (ADT FISHEYE624)
+K = [[610.94,   0.00, 715.11],  # fx, 0, cx  
+     [  0.00, 610.94, 716.71],  # 0, fy, cy
+     [  0.00,   0.00,   1.00]]  # 0, 0, 1
 
-# Current state
-current_pose = Transform(position=[2, 1, 1.5], rotation=quaternion)
-gaze_pixel = (750, 400)  # Where user is looking
-gaze_depth = 1.2m  # Depth at gaze point
+# Fisheye distortion coefficients (Kannala-Brandt)
+distortion = [0.406, -0.490, 0.175, 1.133]  # k1, k2, k3, k4
+
+# Current state from SLAM (T_world_camera)
+current_pose = pose_from_quaternion(qw, qx, qy, qz, tx, ty, tz)
+gaze_pixel = (750, 400)  # From eyegaze.csv
+gaze_depth = 1.2m  # From depth map at gaze point
 ```
 
-**What fails without it:** No data to process - pipeline cannot start.
+**What fails without it:** Cannot accurately project/unproject with fisheye cameras.
 
 ---
 
-## Step 2: Compute Relative Pose
-**What it does:** Calculates transformation between current view and cached view.
+## Step 2: Unproject Gaze to 3D
+**What it does:** Converts 2D gaze pixel to 3D point using depth and fisheye model.
 
-**Concrete Example:**
+**Implementation:**
 ```python
-# Scenario: User moved 50cm right and rotated 30° since caching mask
-cached_pose = Transform(position=[1.5, 1, 1.5], rotation=[0, 0, 0])
-current_pose = Transform(position=[2, 1, 1.5], rotation=[0, 30°, 0])
+# Get depth at gaze point
+z = depth[gaze_y, gaze_x]  # e.g., 1.2m
 
-T_rel = current_pose @ inverse(cached_pose)
-# T_rel represents: 50cm translation + 30° rotation
+# Undistort using Kannala-Brandt model
+undistorted = cv2.fisheye.undistortPoints(
+    np.array([[[gaze_x, gaze_y]]], dtype=np.float32),
+    K=intrinsics,
+    D=distortion_coeffs.reshape((4,1))
+)
 
-# This tells us how to transform points between views
+# Scale normalized ray by depth
+x_3d = undistorted[0,0,0] * z
+y_3d = undistorted[0,0,1] * z
+gaze_3d = [x_3d, y_3d, z]  # in current camera coords
 ```
 
-**What fails without it:** Cannot map points between current and cached views.
+**What fails without it:** Cannot establish 3D correspondence between views.
 
 ---
 
-## Step 3: Back-project Gaze to 3D
-**What it does:** Converts 2D gaze point to 3D world point using depth.
+## Step 3: Find ALL Candidate Masks  
+**What it does:** Projects gaze to ALL cached frames and finds which masks contain it.
 
-**Concrete Example:**
+**Corrected Algorithm:**
 ```python
-# Scenario: Looking at a cup
-gaze_pixel = (750, 400)
-gaze_depth = 1.2m
+candidates = []
+for cached_frame in cache:
+    # Transform: current camera → world → cached camera
+    gaze_world = current_pose @ [gaze_3d, 1]
+    gaze_cached = inv(cached_pose) @ gaze_world
+    
+    # Project to cached image using fisheye model
+    pixels, _ = cv2.fisheye.projectPoints(
+        gaze_cached[:3].reshape(-1, 1, 3),
+        rvec=np.zeros(3),
+        tvec=np.zeros(3),
+        K=cached_intrinsics,
+        D=distortion_coeffs.reshape((4,1))
+    )
+    
+    x, y = int(pixels[0,0,0]), int(pixels[0,0,1])
+    
+    # Check if gaze hits mask
+    if 0 <= x < width and 0 <= y < height:
+        if cached_mask[y, x] > 0:
+            # Compute pose similarity score
+            T_rel = inv(current_pose) @ cached_pose
+            trans_dist = norm(T_rel[:3,3])
+            rot_angle = arccos((trace(T_rel[:3,:3])-1)/2)
+            score = exp(-trans_dist) * exp(-rot_angle)
+            candidates.append((cached_frame, score))
 
-# Inverse projection
-gaze_normalized = K_inv @ [750, 400, 1]  # [0.18, 0.067, 1]
-gaze_3d_camera = gaze_normalized * 1.2m  # [0.216, 0.08, 1.2]
-
-# In current camera coordinates: 21.6cm right, 8cm up, 1.2m forward
+# Select best candidate by pose similarity
+best = max(candidates, key=lambda x: x[1]) if candidates else None
 ```
 
-**What fails without it:** Cannot establish 3D correspondence - stuck in 2D with no way to relate views.
+**What's NEW:** Checks ALL masks first, THEN selects by pose (not vice versa).
 
 ---
 
-## Step 4: Map to Cached View
-**What it does:** Transforms 3D point from current view to cached view.
-
-**Concrete Example:**
-```python
-# Continuing from Step 3
-gaze_3d_current = [0.216, 0.08, 1.2]  # Cup in current view
-
-# Transform to cached view
-gaze_3d_cached = T_rel_inv @ gaze_3d_current
-# After 50cm right movement + 30° rotation:
-# gaze_3d_cached = [-0.284, 0.08, 1.1]  # Different position
-
-# Project to cached image (homogeneous coordinates)
-p_tilde = K @ gaze_3d_cached  # Homogeneous result [x', y', z']
-# Normalize by z to get pixel coordinates:
-gaze_2d_cached = (p_tilde[0] / p_tilde[2], p_tilde[1] / p_tilde[2])
-# gaze_2d_cached = (470, 380)  # Different pixel location!
-
-# The cup that appears at (750, 400) now was at (470, 380) in cached view
-```
-
-**What fails without it:** Cannot find where current gaze maps to in cached mask.
-
----
-
-## Step 5: Bounds Gate
+## Step 4: Validate Selected Candidate
 **What it does:** Checks if projected gaze falls within cached image boundaries.
 
 **Concrete Example:**
@@ -230,8 +254,8 @@ if gaze_2d_cached.x < 0 or gaze_2d_cached.x > 1280:
 
 ---
 
-## Step 6: Gaze-in-Mask Gate (Identity Check)
-**What it does:** Verifies gaze hits the same object by checking if it falls within cached mask.
+## Step 5: Fit Plane to Selected Mask
+**What it does:** Fits a 3D plane to the selected cached mask using depth data.
 
 **Concrete Example:**
 ```python
@@ -260,7 +284,7 @@ else:
 
 ---
 
-## Step 7: Plane Stamp at Cache Time (Reused Later)
+## Step 6: Compute Planar Homography
 **What it does:** When a mask is first cached, store a local plane for that surface in the cached camera frame.
 
 **Concrete Example:**
@@ -295,7 +319,7 @@ cached_plane = {'normal': n, 'distance': d}  # Only 4 floats!
 
 ---
 
-## Step 8: Homography for This Frame
+## Step 7: Warp Mask Using Homography
 **What it does:** Computes the homography to map cached mask to current view.
 
 ### Method A: From Plane + Pose (Fast)
@@ -363,7 +387,7 @@ if cc < 0.90:  # Poor correlation
 
 ---
 
-## Step 9: Warp the Cached Mask
+## Step 8: Validate Warped Mask
 **What it does:** Applies the homography to transform cached mask to current view.
 
 **Concrete Example:**
@@ -396,7 +420,7 @@ warped_mask = cv2.morphologyEx(warped_mask, cv2.MORPH_OPEN, kernel)   # Remove n
 
 ---
 
-## Step 10: Single Acceptance Gate (Geom. Fit if 8B + Exposure-Compensated Photometric)
+## Step 9: Final Decision
 **What it does:** Validates the warped mask through geometric and photometric checks.
 
 ### Geometric Fit Gate (if Method 8B)
@@ -493,10 +517,11 @@ Step 2: T_rel = 50cm right + 30° rotation
 Step 3: gaze_3d = [0.3, 0.067, 1.0]
 Step 4: gaze_cached = transform → (485, 375)
 Step 5: ✓ (485, 375) within [0,1280]x[0,720]
-Step 6: ✓ (485, 375) inside cup_mask
-Step 7: Example plane fitted: n=[0,0,-1], d=1.0m (horizontal surface)
-Step 8: H computed from plane + pose
-Step 9: Mask warped via homography (INTER_NEAREST)
+Step 4: ✓ Gaze found in cached mask
+Step 5: Plane fitted: n=[0,0,-1], d=1.0m (horizontal surface)
+Step 6: H computed from plane + poses
+Step 7: Mask warped via homography
+Step 8: Validation passed
 Step 10a: ✓ Geometric validation passed
 Step 10b: ✓ SSIM=0.91, ECC=0.93
 
