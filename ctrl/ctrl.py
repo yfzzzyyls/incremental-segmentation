@@ -113,12 +113,15 @@ class MaskReuseController:
             )
         
         # Step 1: Project current gaze to 3D
+        print(f"  Current gaze pixel: {current.gaze_pixel}")
         gaze_3d = self._project_gaze_to_3d(
             current.gaze_pixel,
             current.depth,
             current.intrinsics,
             current.distortion_coeffs
         )
+        if gaze_3d is not None:
+            print(f"  Gaze 3D point: {gaze_3d}")
         
         if gaze_3d is None:
             return ControlOutput(
@@ -151,12 +154,16 @@ class MaskReuseController:
             
             # Check if gaze hits the mask
             if self._gaze_in_mask(gaze_in_cached, cached_frame.mask):
+                # Debug: Check what object the gaze hits
+                mask_value = cached_frame.mask[gaze_in_cached[1], gaze_in_cached[0]]
+                print(f"    Frame {frame_id}: Gaze at {gaze_in_cached} hits mask value {mask_value}")
+
                 # Compute pose similarity score for ranking
                 T_rel = np.linalg.inv(current.pose) @ cached_frame.pose
                 translation_dist = np.linalg.norm(T_rel[:3, 3])
                 rotation_angle = np.arccos(np.clip((np.trace(T_rel[:3, :3]) - 1) / 2, -1, 1))
                 pose_score = np.exp(-translation_dist) * np.exp(-rotation_angle)
-                
+
                 candidates.append({
                     'frame_id': frame_id,
                     'frame': cached_frame,
@@ -182,51 +189,33 @@ class MaskReuseController:
         print(f"  Selected cache frame {best_match}: pose_score={best_candidate['pose_score']:.3f}, "
               f"trans={best_candidate['translation_dist']:.2f}m, rot={np.degrees(best_candidate['rotation_angle']):.1f}°")
         
-        # Step 5: Get or compute plane parameters
-        if cached_frame.plane_params is not None:
-            plane_params = cached_frame.plane_params
-        else:
-            # Fallback: fit plane if not cached
-            K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
-            plane_params = self._fit_plane_to_mask(
-                cached_frame.mask,
-                cached_frame.depth,
-                K_cached
-            )
-            
-            if plane_params is None:
-                return ControlOutput(
-                    decision="SEG",
-                    reason="Plane fitting failed",
-                    cached_frame_id=best_match
-                )
-        
-        # Step 6: Compute homography and warp mask
+        # Step 5: Dense 3D reprojection using ground truth depth
         K_cached = cached_frame.intrinsics if cached_frame.intrinsics is not None else current.intrinsics
-        homography = self._compute_planar_homography(
-            plane_params,
+
+        warped_mask = self._dense_reproject_mask(
+            cached_frame.mask,
+            cached_frame.depth,
             cached_frame.pose,
             current.pose,
             K_cached,
-            current.intrinsics
+            current.intrinsics,
+            current.distortion_coeffs,
+            current.rgb.shape[:2]
         )
-        
-        if homography is None:
+
+        if warped_mask is None:
             return ControlOutput(
                 decision="SEG",
-                reason="Homography computation failed",
+                reason="Dense reprojection failed",
                 cached_frame_id=best_match
             )
         
-        warped_mask = self._warp_mask(cached_frame.mask, homography, current.rgb.shape[:2])
-        
-        # Step 7: Validate warped mask
-        validation_result = self._validate_warped_mask(
+        # Step 6: Validate warped mask (no homography needed for dense reprojection)
+        validation_result = self._validate_warped_mask_dense(
             warped_mask,
             current.rgb,
             cached_frame.rgb,
-            cached_frame.mask,
-            homography
+            cached_frame.mask
         )
         
         if not validation_result['valid']:
@@ -451,23 +440,29 @@ class MaskReuseController:
         self,
         gaze_pixel: Tuple[int, int],
         mask: np.ndarray,
-        radius: int = 5
+        radius: int = 0  # Changed to 0 for strict matching
     ) -> bool:
         """
         Check if gaze point falls within mask region.
-        Uses a small radius for robustness.
+        With radius=0, only checks exact pixel (strict matching).
         """
         x, y = gaze_pixel
         h, w = mask.shape
-        
-        # Check in a small neighborhood
+
+        if radius == 0:
+            # Strict mode: check only exact pixel
+            if 0 <= x < w and 0 <= y < h:
+                return mask[y, x] > 0
+            return False
+
+        # Original neighborhood check (if radius > 0)
         y_min = max(0, y - radius)
         y_max = min(h, y + radius + 1)
         x_min = max(0, x - radius)
         x_max = min(w, x + radius + 1)
-        
+
         region = mask[y_min:y_max, x_min:x_max]
-        
+
         # Return true if any pixel in region is in mask
         return np.any(region > 0)
     
@@ -583,6 +578,238 @@ class MaskReuseController:
         
         return H
     
+    def _dense_reproject_mask(
+        self,
+        mask: np.ndarray,
+        depth_cached: np.ndarray,
+        cached_pose: np.ndarray,
+        current_pose: np.ndarray,
+        K_cached: np.ndarray,
+        K_current: np.ndarray,
+        distortion_coeffs: Optional[np.ndarray],
+        target_shape: Tuple[int, int]
+    ) -> Optional[np.ndarray]:
+        """
+        Dense 3D reprojection of mask using ground truth depth at every pixel.
+        Optimized version using vectorized operations and sampling.
+
+        Args:
+            mask: Binary mask in cached frame
+            depth_cached: Dense depth map of cached frame
+            cached_pose: 4x4 pose of cached frame (camera-to-world)
+            current_pose: 4x4 pose of current frame (camera-to-world)
+            K_cached: 3x3 intrinsics of cached camera
+            K_current: 3x3 intrinsics of current camera
+            distortion_coeffs: Fisheye distortion coefficients
+            target_shape: (H, W) of target image
+
+        Returns:
+            Reprojected mask or None if failed
+        """
+        h, w = target_shape
+        warped_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Get mask pixels
+        mask_points = np.where(mask > 0)
+        if len(mask_points[0]) == 0:
+            return None
+
+        total_mask_pixels = len(mask_points[0])
+
+        # Process ALL pixels - no sampling
+        y_coords = mask_points[0]
+        x_coords = mask_points[1]
+
+        # Get depths for all sampled points
+        depths = depth_cached[y_coords, x_coords]
+
+        # Filter out invalid depths
+        valid_mask = (depths > 0) & ~np.isnan(depths) & ~np.isinf(depths)
+        x_coords = x_coords[valid_mask]
+        y_coords = y_coords[valid_mask]
+        depths = depths[valid_mask]
+
+        if len(depths) == 0:
+            return None
+
+        # Transform from cached to current camera
+        T_rel = np.linalg.inv(current_pose) @ cached_pose
+
+        # Vectorized unprojection
+        if distortion_coeffs is not None and len(distortion_coeffs) >= 4:
+            # Fisheye unprojection (batch processing)
+            pixels = np.stack([x_coords, y_coords], axis=-1).reshape(-1, 1, 2).astype(np.float32)
+            undistorted = cv2.fisheye.undistortPoints(
+                pixels,
+                K=K_cached,
+                D=distortion_coeffs[:4].reshape((4, 1))
+            )
+            undistorted = undistorted.reshape(-1, 2)
+
+            # Scale to depth
+            points_3d = np.zeros((len(depths), 3))
+            points_3d[:, 0] = undistorted[:, 0] * depths
+            points_3d[:, 1] = undistorted[:, 1] * depths
+            points_3d[:, 2] = depths
+        else:
+            # Pinhole unprojection (vectorized)
+            fx, fy = K_cached[0, 0], K_cached[1, 1]
+            cx, cy = K_cached[0, 2], K_cached[1, 2]
+
+            points_3d = np.zeros((len(depths), 3))
+            points_3d[:, 0] = (x_coords - cx) * depths / fx
+            points_3d[:, 1] = (y_coords - cy) * depths / fy
+            points_3d[:, 2] = depths
+
+        # Transform all points to current camera (vectorized)
+        points_3d_homo = np.hstack([points_3d, np.ones((len(points_3d), 1))])
+        points_current = (T_rel @ points_3d_homo.T).T[:, :3]
+
+        # Filter points behind camera
+        valid_mask = points_current[:, 2] > 0
+        points_current = points_current[valid_mask]
+
+        if len(points_current) == 0:
+            return None
+
+        # Project to current camera (vectorized)
+        if distortion_coeffs is not None and len(distortion_coeffs) >= 4:
+            # Fisheye projection
+            points_3d_cv = points_current.reshape(-1, 1, 3).astype(np.float32)
+            pixels, _ = cv2.fisheye.projectPoints(
+                points_3d_cv,
+                rvec=np.zeros(3, dtype=np.float32),
+                tvec=np.zeros(3, dtype=np.float32),
+                K=K_current,
+                D=distortion_coeffs[:4].reshape((4, 1))
+            )
+            pixels = pixels.reshape(-1, 2)
+        else:
+            # Pinhole projection (vectorized)
+            fx, fy = K_current[0, 0], K_current[1, 1]
+            cx, cy = K_current[0, 2], K_current[1, 2]
+
+            pixels = np.zeros((len(points_current), 2))
+            pixels[:, 0] = fx * points_current[:, 0] / points_current[:, 2] + cx
+            pixels[:, 1] = fy * points_current[:, 1] / points_current[:, 2] + cy
+
+        # Set pixels in warped mask
+        pixels = pixels.astype(int)
+        valid_mask = (pixels[:, 0] >= 0) & (pixels[:, 0] < w) & \
+                     (pixels[:, 1] >= 0) & (pixels[:, 1] < h)
+        valid_pixels = pixels[valid_mask]
+
+        for px, py in valid_pixels:
+            warped_mask[py, px] = 255
+
+        valid_projections = len(valid_pixels)
+
+        # Apply morphological operations to fill small gaps
+        if valid_projections > 10:
+            kernel = np.ones((3, 3), np.uint8)
+            warped_mask = cv2.morphologyEx(warped_mask, cv2.MORPH_CLOSE, kernel)
+
+        print(f"    Dense reprojection: {total_mask_pixels} mask pixels -> {valid_projections} valid projections")
+
+        return warped_mask if valid_projections > 100 else None
+
+    def _validate_warped_mask_dense(
+        self,
+        warped_mask: np.ndarray,
+        current_rgb: np.ndarray,
+        cached_rgb: np.ndarray,
+        cached_mask: np.ndarray
+    ) -> Dict[str, Any]:
+        """
+        Validation for dense reprojection with color histogram comparison.
+        """
+        # Check if mask is too small
+        mask_pixels = np.sum(warped_mask > 0)
+
+        if mask_pixels < 100:  # Too few pixels
+            return {
+                'valid': False,
+                'reason': 'Warped mask too small',
+                'confidence': 0.0
+            }
+
+        # Check visibility ratio
+        original_pixels = np.sum(cached_mask > 0)
+        visibility_ratio = min(1.0, mask_pixels / max(original_pixels, 1))
+
+        if visibility_ratio < self.min_visible_ratio:
+            return {
+                'valid': False,
+                'reason': f'Low visibility ratio: {visibility_ratio:.2f}',
+                'confidence': visibility_ratio
+            }
+
+        # Color histogram comparison for photometric consistency
+        mask_bool = warped_mask > 0
+        cached_mask_bool = cached_mask > 0
+
+        if np.any(mask_bool) and np.any(cached_mask_bool):
+            # Get masked regions
+            current_region = current_rgb[mask_bool]
+            cached_region = cached_rgb[cached_mask_bool]
+
+            if len(current_region) > 0 and len(cached_region) > 0:
+                # Compute color histograms for each channel
+                hist_similarity_sum = 0.0
+
+                for channel in range(3):  # RGB channels
+                    # Calculate histograms with 32 bins (robust to minor variations)
+                    hist_current = cv2.calcHist(
+                        [current_region[:, channel].astype(np.uint8)],
+                        [0], None, [32], [0, 256]
+                    )
+                    hist_cached = cv2.calcHist(
+                        [cached_region[:, channel].astype(np.uint8)],
+                        [0], None, [32], [0, 256]
+                    )
+
+                    # Normalize histograms
+                    hist_current = cv2.normalize(hist_current, hist_current).flatten()
+                    hist_cached = cv2.normalize(hist_cached, hist_cached).flatten()
+
+                    # Compare using correlation (1.0 = identical, -1.0 = opposite)
+                    correlation = cv2.compareHist(hist_current, hist_cached, cv2.HISTCMP_CORREL)
+
+                    # Handle NaN (can occur if histogram is uniform)
+                    if np.isnan(correlation):
+                        correlation = 0.5
+
+                    hist_similarity_sum += correlation
+
+                # Average similarity across channels
+                hist_similarity = hist_similarity_sum / 3.0
+
+                # Convert to 0-1 range (correlation is -1 to 1)
+                hist_similarity = (hist_similarity + 1.0) / 2.0
+
+                print(f"    Color histogram similarity: {hist_similarity:.3f} (threshold={self.photometric_threshold})")
+
+                if hist_similarity < self.photometric_threshold:
+                    return {
+                        'valid': False,
+                        'reason': f'Low color histogram similarity: {hist_similarity:.2f}',
+                        'confidence': hist_similarity
+                    }
+
+                # Combined confidence
+                confidence = min(visibility_ratio, hist_similarity)
+            else:
+                confidence = visibility_ratio
+        else:
+            confidence = visibility_ratio
+
+        # All checks passed
+        return {
+            'valid': True,
+            'reason': 'Dense reprojection successful',
+            'confidence': confidence
+        }
+
     def _warp_mask(
         self,
         mask: np.ndarray,
@@ -599,10 +826,10 @@ class MaskReuseController:
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0
         )
-        
+
         # Ensure binary mask
         warped = (warped > 0).astype(np.uint8) * 255
-        
+
         return warped
     
     def _validate_warped_mask(

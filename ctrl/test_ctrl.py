@@ -743,19 +743,11 @@ def test_control_pipeline(
         total_reuses = len(reuse_frames)
         
         if total_reuses > 0:
-            # Save 1/5 of reused frames with even spacing
-            num_to_save = max(1, total_reuses // 5)  # At least 1, otherwise 1/5 of total
-            
-            # Calculate even spacing
-            if total_reuses <= num_to_save:
-                # Save all if we have fewer than what we want to save
-                indices_to_save = list(range(total_reuses))
-            else:
-                # Calculate step size for even spacing
-                step = total_reuses / num_to_save
-                indices_to_save = [int(i * step) for i in range(num_to_save)]
-            
-            print(f"\nSaving {len(indices_to_save)} evenly spaced comparison images from {total_reuses} reuse frames (1/5 sampling)")
+            # Save ALL reused frames
+            num_to_save = total_reuses  # Save all reused frames
+            indices_to_save = list(range(total_reuses))
+
+            print(f"\nSaving {len(indices_to_save)} comparison images from {total_reuses} reuse frames (all frames)")
             print(f"Selected reuse indices: {indices_to_save[:10]}{'...' if len(indices_to_save) > 10 else ''}")
             
             for save_idx, reuse_idx in enumerate(indices_to_save):
@@ -795,7 +787,7 @@ def main():
                        help="Size of LRU cache (default: 30)")
     parser.add_argument("--visualize", action="store_true",
                        help="Save visualizations")
-    parser.add_argument("--output-dir", type=str, default="./output",
+    parser.add_argument("--output-dir", type=str, default="ctrl/output",
                        help="Directory to save outputs")
     
     args = parser.parse_args()
