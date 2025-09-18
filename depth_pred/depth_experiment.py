@@ -198,7 +198,7 @@ class DepthExperiment:
 
         return results
 
-    def run_real_frame_pair(self, frame1_idx: int, frame2_idx: int) -> Dict:
+    def run_real_frame_pair(self, frame1_idx: int, frame2_idx: int, visualize: bool = True) -> Dict:
         """Test on real frame pair."""
         print(f"\n=== Real Frame Pair ({frame1_idx}→{frame2_idx}) ===")
 
@@ -257,10 +257,102 @@ class DepthExperiment:
                 'iou_strict': iou_strict,
                 'iou_fill': iou_fill,
                 'error_stats': error_stats,
-                'info': info
+                'info': info,
+                'mask_pred': mask2_pred
             }
 
+        # Add ground truth and original masks for visualization
+        results['mask1'] = mask1
+        results['mask2_gt'] = mask2_gt
+        results['data1'] = data1
+        results['data2'] = data2
+
+        # Visualize if requested
+        if visualize:
+            self.visualize_projection(frame1_idx, frame2_idx, results)
+
         return results
+
+    def visualize_projection(self, frame1_idx: int, frame2_idx: int, results: Dict):
+        """Create visualization of mask projection."""
+        from pathlib import Path
+
+        # Create output directory
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True, parents=True)
+
+        # Get data
+        mask1 = results['mask1']
+        mask2_gt = results['mask2_gt']
+        data1 = results['data1']
+        data2 = results['data2']
+
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+        # Frame 1 with mask
+        axes[0, 0].imshow(cv2.cvtColor(data1['rgb'], cv2.COLOR_BGR2RGB))
+        axes[0, 0].contour(mask1, colors='g', linewidths=2)
+        gaze1 = data1['gaze']
+        axes[0, 0].add_patch(Circle(gaze1, 10, fill=True, color='red'))
+        axes[0, 0].set_title(f'Frame {frame1_idx} (Source)\nGaze: ({gaze1[0]}, {gaze1[1]})')
+        axes[0, 0].axis('off')
+
+        # Frame 2 with GT mask
+        axes[0, 1].imshow(cv2.cvtColor(data2['rgb'], cv2.COLOR_BGR2RGB))
+        axes[0, 1].contour(mask2_gt, colors='g', linewidths=2)
+        gaze2 = data2['gaze']
+        axes[0, 1].add_patch(Circle(gaze2, 10, fill=True, color='red'))
+        axes[0, 1].set_title(f'Frame {frame2_idx} (Target)\nGround Truth')
+        axes[0, 1].axis('off')
+
+        # Frame 2 with projected mask (Dense GT)
+        if 'dense_gt' in results:
+            mask2_pred_dense = results['dense_gt']['mask_pred']
+            axes[0, 2].imshow(cv2.cvtColor(data2['rgb'], cv2.COLOR_BGR2RGB))
+            axes[0, 2].contour(mask2_pred_dense, colors='r', linewidths=2)
+            axes[0, 2].contour(mask2_gt, colors='g', linewidths=1, alpha=0.5)
+            iou = results['dense_gt']['iou_strict']
+            axes[0, 2].set_title(f'Dense GT Projection\nIoU: {iou:.3f}')
+            axes[0, 2].axis('off')
+
+        # Depth maps
+        axes[1, 0].imshow(data1['depth'], cmap='viridis')
+        axes[1, 0].contour(mask1, colors='r', linewidths=1)
+        axes[1, 0].set_title(f'Depth Frame {frame1_idx}')
+        axes[1, 0].axis('off')
+
+        axes[1, 1].imshow(data2['depth'], cmap='viridis')
+        axes[1, 1].contour(mask2_gt, colors='g', linewidths=1)
+        axes[1, 1].set_title(f'Depth Frame {frame2_idx}')
+        axes[1, 1].axis('off')
+
+        # Overlay comparison
+        h, w = mask2_gt.shape
+        overlay = np.zeros((h, w, 3), dtype=np.uint8)
+        overlay[mask2_gt > 0] = [0, 255, 0]  # Green for GT
+        if 'dense_gt' in results:
+            mask2_pred_dense = results['dense_gt']['mask_pred']
+            overlay[mask2_pred_dense > 0, 0] = 255  # Red channel for projected
+        axes[1, 2].imshow(overlay)
+        axes[1, 2].set_title('Overlay: Green=GT, Red=Projected, Yellow=Both')
+        axes[1, 2].axis('off')
+
+        # Add pose info
+        if 'pose_info' in results:
+            info = results['pose_info']
+            fig.text(0.5, 0.02, f'Motion: {info["translation_m"]*100:.1f}cm, {info["rotation_deg"]:.1f}°',
+                    ha='center', fontsize=12)
+
+        plt.suptitle(f'Mask Projection: Frame {frame1_idx} → {frame2_idx}', fontsize=14)
+        plt.tight_layout()
+
+        # Save figure
+        filename = f"projection_GT_{frame1_idx}_to_{frame2_idx}.png"
+        plt.savefig(output_dir / filename, dpi=150, bbox_inches='tight')
+        print(f"  Visualization saved to output/{filename}")
+
+        plt.close()  # Close to free memory
 
     def run_full_experiment(self, frame_pairs: List[Tuple[int, int]]):
         """Run complete experiment on multiple frame pairs."""

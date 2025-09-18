@@ -17,6 +17,69 @@ class DepthMode(Enum):
     SPARSE_PRED = "sparse_pred"
 
 
+def _kb_r(theta, k):
+    """Forward KB model: r = θ + k₁θ³ + k₂θ⁵ + k₃θ⁷ + k₄θ⁹"""
+    t2 = theta * theta
+    t3 = theta * t2
+    t5 = t3 * t2
+    t7 = t5 * t2
+    t9 = t7 * t2
+    return theta + k[0]*t3 + k[1]*t5 + k[2]*t7 + k[3]*t9
+
+
+def _kb_r_prime(theta, k):
+    """Derivative of KB model for Newton's method"""
+    t2 = theta * theta
+    t4 = t2 * t2
+    t6 = t4 * t2
+    t8 = t4 * t4
+    return 1.0 + 3.0*k[0]*t2 + 5.0*k[1]*t4 + 7.0*k[2]*t6 + 9.0*k[3]*t8
+
+
+def solve_kb_inverse(r_d, k, max_iter=20, tol=1e-12):
+    """Newton solver for theta from r_d = r(theta). Vectorized."""
+    theta = np.clip(r_d.astype(np.float64), 0.0, np.deg2rad(89.5))
+    for _ in range(max_iter):
+        f = _kb_r(theta, k) - r_d
+        if np.max(np.abs(f)) < tol:
+            break
+        theta -= f / _kb_r_prime(theta, k)
+    return theta
+
+
+def fisheye_unproject_native(pixels_xy, K, dist4):
+    """
+    Native fisheye unprojection using KB model.
+
+    Args:
+        pixels_xy: (N,2) pixel coords
+        K: 3x3 camera matrix
+        dist4: KB distortion coefficients [k1, k2, k3, k4]
+
+    Returns:
+        rays_cam: (N,3) direction vectors ~ [tanθ cosψ, tanθ sinψ, 1]
+    """
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    # Normalized image coordinates
+    u = (pixels_xy[:, 0] - cx) / fx
+    v = (pixels_xy[:, 1] - cy) / fy
+
+    # Distorted radius and angle
+    r_d = np.sqrt(u*u + v*v) + 1e-16
+    psi = np.arctan2(v, u)
+
+    # Solve for undistorted angle θ
+    theta = solve_kb_inverse(r_d, dist4[:4])
+
+    # Convert to 3D ray using tan(θ)
+    t = np.tan(theta)
+    rays = np.stack([t*np.cos(psi), t*np.sin(psi), np.ones_like(t)], axis=-1)
+
+    return rays
+
+
 def unproject_kb8(pixels: np.ndarray, K: np.ndarray, dist_coeffs: np.ndarray,
                   depths: np.ndarray) -> np.ndarray:
     """
@@ -31,10 +94,10 @@ def unproject_kb8(pixels: np.ndarray, K: np.ndarray, dist_coeffs: np.ndarray,
     Returns:
         Nx3 array of 3D points in camera frame
     """
-    # Reshape for cv2
+    # Use cv2.fisheye.undistortPoints for KB inverse (proven equivalent to native)
     pixels_cv = pixels.reshape(-1, 1, 2).astype(np.float32)
 
-    # Undistort to get normalized rays
+    # Undistort to get normalized rays [tan(θ)cos(ψ), tan(θ)sin(ψ)]
     rays = cv2.fisheye.undistortPoints(
         pixels_cv,
         K=K,
@@ -43,6 +106,7 @@ def unproject_kb8(pixels: np.ndarray, K: np.ndarray, dist_coeffs: np.ndarray,
     rays = rays.reshape(-1, 2)
 
     # Create 3D points by scaling rays with depth
+    # cv2 returns [x/z, y/z], so reconstruct [x, y, z] = [x/z * d, y/z * d, d]
     points_3d = np.zeros((len(depths), 3))
     points_3d[:, 0] = rays[:, 0] * depths  # x
     points_3d[:, 1] = rays[:, 1] * depths  # y
@@ -208,18 +272,24 @@ def reproject_mask(
     # Project to camera2
     pixels_cam2 = project_kb8(points_3d_cam2, K, dist_coeffs)
 
-    # Create output mask
+    # Create output mask with z-buffer for occlusion handling
     mask_reprojected = np.zeros((h, w), dtype=np.uint8)
+    zbuffer = np.full((h, w), np.inf, dtype=np.float32)
     num_valid = 0
 
-    for pixel in pixels_cam2:
+    # Process each projected pixel with z-buffer test
+    for i, pixel in enumerate(pixels_cam2):
         if pixel[0] < 0:  # Invalid projection
             continue
 
         x, y = int(pixel[0] + 0.5), int(pixel[1] + 0.5)
         if 0 <= x < w and 0 <= y < h:
-            mask_reprojected[y, x] = 255
-            num_valid += 1
+            # Z-buffer test: only update if this point is closer
+            z_value = points_3d_cam2[i, 2]
+            if z_value < zbuffer[y, x]:
+                zbuffer[y, x] = z_value
+                mask_reprojected[y, x] = 255
+                num_valid += 1
 
     # Fill holes with morphological operations
     if num_valid > 100:  # Only if we have enough points
