@@ -184,7 +184,9 @@ def reproject_mask(
     dist_coeffs: np.ndarray,
     depth_mode: DepthMode,
     gaze_point: Optional[Tuple[int, int]] = None,
-    patch_size: int = 22
+    patch_size: int = 22,
+    predicted_depth: Optional[float] = None,
+    sparse_info: Optional[Dict] = None,
 ) -> Tuple[np.ndarray, Dict]:
     """
     Reproject a mask from camera1 to camera2.
@@ -218,7 +220,7 @@ def reproject_mask(
         mask_depths = depth[mask_coords[:, 0], mask_coords[:, 1]]
 
     elif depth_mode == DepthMode.SPARSE_GT:
-        # Use depth from patch around gaze
+        # Use averaged depth from patch around gaze
         if gaze_point is None:
             return np.zeros_like(mask), {'error': 'No gaze point for sparse mode'}
 
@@ -237,20 +239,31 @@ def reproject_mask(
         if len(valid_depths) == 0:
             return np.zeros_like(mask), {'error': 'No valid depth in patch'}
 
-        # Use median depth for all mask pixels
-        sparse_depth = np.median(valid_depths)
-        mask_depths = np.full(len(mask_pixels), sparse_depth)
+        # Use mean depth for all mask pixels to simulate averaged sparse depth
+        sparse_depth = float(np.mean(valid_depths))
+        mask_depths = np.full(len(mask_pixels), sparse_depth, dtype=np.float32)
 
         info_sparse = {
-            'sparse_depth': sparse_depth,
-            'patch_valid_pixels': len(valid_depths)
+            'sparse_depth_mean': sparse_depth,
+            'patch_valid_pixels': int(len(valid_depths)),
+            'patch_depth_min': float(valid_depths.min()),
+            'patch_depth_max': float(valid_depths.max())
         }
 
     elif depth_mode == DepthMode.SPARSE_PRED:
-        # TODO: Load depth predictor and get prediction
-        # For now, use sparse GT as placeholder
-        return reproject_mask(mask, depth, T_camera2_camera1, K, dist_coeffs,
-                            DepthMode.SPARSE_GT, gaze_point, patch_size)
+        if predicted_depth is None:
+            return np.zeros_like(mask), {
+                'error': 'No predicted depth provided for sparse_pred mode'
+            }
+
+        sparse_depth = float(predicted_depth)
+        mask_depths = np.full(len(mask_pixels), sparse_depth, dtype=np.float32)
+
+        info_sparse = {
+            'sparse_depth_pred': sparse_depth
+        }
+        if sparse_info:
+            info_sparse.update(sparse_info)
 
     else:
         raise ValueError(f"Unknown depth mode: {depth_mode}")
@@ -306,7 +319,7 @@ def reproject_mask(
         'depth_mode': depth_mode.value
     }
 
-    if depth_mode == DepthMode.SPARSE_GT:
+    if depth_mode in (DepthMode.SPARSE_GT, DepthMode.SPARSE_PRED):
         info.update(info_sparse)
 
     return mask_filled, info
